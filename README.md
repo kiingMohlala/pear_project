@@ -19,16 +19,22 @@ Agent (base)
  ├── LegalAgent      (stub → v0.3)
  └── FinanceAgent    (stub → v0.4)
 
-Orchestrator → routes by capability / keywords
-Memory       → session history + notes
-Tools        → shared file & OS helpers
-Permissions  → simple action gates
+Orchestrator → capability-based planner + Task model
+Memory       → working / long-term / knowledge store
+Tools        → central Tool Registry
+Permissions  → action gates
+Events       → TaskCreated → AgentSelected → ToolCalled → TaskCompleted
 ```
 
 ## Quick start
 
 ```bash
-cd PEAR
+git clone https://github.com/kiingMohlala/pear_project.git
+cd pear_project
+
+# One-time: expand core/llm.py and core/memory.py from compressed payloads
+python scripts/expand_core.py
+
 pip install -r requirements.txt
 python -m ui.app
 ```
@@ -48,7 +54,6 @@ you › search files *.pdf in ~/Documents
 ## Roadmap
 
 See `docs/roadmap.md`.
-
 
 ## LLM setup
 
