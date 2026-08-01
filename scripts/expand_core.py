@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Expand compressed core modules (one-time setup if needed)."""
-import base64, zlib
+"""One-time: expand core/llm.py and core/memory.py from compressed payloads."""
+import base64
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-FILES = {
-    "core/llm.py": ROOT / "core" / "_llm.py.z64",
-    "core/memory.py": ROOT / "core" / "_memory.py.z64",
+MAP = {
+    "core/llm.py": "core/_llm.py.z64",
+    "core/memory.py": "core/_memory.py.z64",
 }
 
-for dest, src in FILES.items():
+for dest_rel, src_rel in MAP.items():
+    src = ROOT / src_rel
+    dest = ROOT / dest_rel
     if not src.exists():
-        print(f"skip {dest}: missing {src.name}")
+        print(f"missing {src_rel}")
         continue
-    out = ROOT / dest
-    if out.exists() and out.stat().st_size > 100:
-        print(f"ok  {dest} already present")
-        continue
-    data = zlib.decompress(base64.b64decode(src.read_text().strip()))
-    out.write_bytes(data)
-    print(f"wrote {dest} ({len(data)} bytes)")
+    raw = src.read_text().strip().replace("\n", "")
+    data = zlib.decompress(base64.b64decode(raw))
+    dest.write_bytes(data)
+    print(f"wrote {dest_rel} ({len(data)} bytes)")
+print("done")
