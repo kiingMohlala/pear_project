@@ -1,0 +1,23 @@
+version: "3.9"
+services:
+  pear:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      PEAR_HOST: "0.0.0.0"
+      PEAR_PORT: "8080"
+      PEAR_DATA: "/data"
+      PEAR_SPEECH_PROVIDER: "offline"
+      PEAR_VISION_PROVIDER: "offline"
+      PEAR_TTS_PROVIDER: "offline"
+      PEAR_COMPUTER_BACKEND: "sim"
+    volumes:
+      - pear_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  pear_data:
