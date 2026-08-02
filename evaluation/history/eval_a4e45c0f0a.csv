@@ -1,0 +1,20 @@
+suite,case,ok,score,latency_ms,detail
+desktop,mkdir,True,1.0,0.6322860717773438,
+desktop,list,True,1.0,0.1990795135498047,
+finance,import,True,1.0,52.52504348754883,
+finance,summary,True,1.0,0.19311904907226562,
+legal,import,True,1.0,4.128932952880859,
+legal,risks,True,1.0,1.9860267639160156,risks=9
+media,ocr,True,1.0,0.16832351684570312,
+media,transcribe,True,1.0,0.12278556823730469,
+planner,open app calculator,True,1.0,0.2377033233642578,got=desktop expected=desktop
+planner,hello there,True,1.0,0.06794929504394531,got=personal expected=personal
+planner,analyse my budget,True,1.0,0.056743621826171875,got=finance expected=finance
+planner,review this NDA contract,True,1.0,0.0514984130859375,got=legal expected=legal
+planner,open url https://example.com,True,1.0,0.05745887756347656,got=browser expected=browser
+plugins,discover,True,1.0,1.1200904846191406,"{'notion', 'slack', 'weather'}"
+plugins,load_weather,True,1.0,488.48772048950195,
+retrieval,non-compete obligations,True,1.0,0.13566017150878906,hits=1
+retrieval,indemnification liability,True,1.0,0.072479248046875,hits=1
+retrieval,governing law arbitration,True,1.0,0.06222724914550781,hits=1
+workflow,contract_review,True,1.0,30.66706657409668,WorkflowStatus.COMPLETED

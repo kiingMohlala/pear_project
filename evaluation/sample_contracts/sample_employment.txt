@@ -1,0 +1,19 @@
+EMPLOYMENT AGREEMENT
+
+This Employment Agreement is entered into between Acme Corp (the "Company") and Jane Doe (the "Employee").
+
+1. DUTIES OF EMPLOYMENT
+Employee shall perform the duties of Software Engineer as assigned by the Company.
+
+2. COMPENSATION
+Employee shall receive a salary of R50,000 per month, payable monthly.
+
+3. TERMINATION
+Either party may terminate employment with thirty (30) days written notice.
+The Company may terminate for cause immediately.
+
+4. CONFIDENTIALITY
+Employee shall not disclose confidential Company information during or after employment.
+
+5. GOVERNING LAW
+This Agreement is governed by the laws of South Africa.

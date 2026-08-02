@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PEAR Dashboard</title>
+  <style>
+    :root { --bg:#0f1419; --card:#1a2332; --text:#e7ecf3; --muted:#8b9bb4; --accent:#3d8bfd; --ok:#3dd68c; }
+    body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:1rem 1.5rem; border-bottom:1px solid #243044; display:flex; gap:1rem; align-items:center; }
+    h1 { font-size:1.2rem; margin:0; }
+    main { display:grid; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); gap:1rem; padding:1rem; }
+    .card { background:var(--card); border-radius:12px; padding:1rem; border:1px solid #243044; }
+    .card h2 { margin:0 0 .5rem; font-size:.95rem; color:var(--muted); font-weight:600; }
+    pre { white-space:pre-wrap; word-break:break-word; font-size:.8rem; color:var(--text); max-height:240px; overflow:auto; }
+    input, button { background:#0f1419; color:var(--text); border:1px solid #243044; border-radius:8px; padding:.45rem .7rem; }
+    button { background:var(--accent); border:none; cursor:pointer; font-weight:600; }
+    .row { display:flex; gap:.5rem; flex-wrap:wrap; margin-bottom:.5rem; }
+    .pill { display:inline-block; padding:.15rem .5rem; border-radius:999px; background:#243044; font-size:.75rem; color:var(--muted); }
+    .ok { color:var(--ok); }
+  </style>
+</head>
+<body>
+<header>
+  <h1>PEAR <span class="pill">v2.20</span></h1>
+  <div class="row">
+    <input id="user" placeholder="username" value="demo" size="10" />
+    <input id="pass" placeholder="password" type="password" value="demo" size="10" />
+    <button onclick="login()">Login</button>
+    <span id="status" class="pill">logged out</span>
+  </div>
+</header>
+<main>
+  <section class="card">
+    <h2>Health</h2>
+    <pre id="health">—</pre>
+  </section>
+  <section class="card">
+    <h2>Agents</h2>
+    <pre id="agents">—</pre>
+  </section>
+  <section class="card">
+    <h2>Goals</h2>
+    <pre id="goals">—</pre>
+  </section>
+  <section class="card">
+    <h2>Recommendations</h2>
+    <pre id="recs">—</pre>
+  </section>
+  <section class="card" style="grid-column:1/-1">
+    <h2>Chat</h2>
+    <div class="row">
+      <input id="msg" placeholder="Ask PEAR…" style="flex:1; min-width:200px" />
+      <button onclick="chat()">Send</button>
+    </div>
+    <pre id="chat">—</pre>
+  </section>
+</main>
+<script>
+let token = localStorage.getItem('pear_token') || '';
+const $ = id => document.getElementById(id);
+function authHeaders() {
+  return token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+}
+async function login() {
+  const r = await fetch('/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: $('user').value, password: $('pass').value })
+  });
+  const j = await r.json();
+  if (j.ok) {
+    token = j.token;
+    localStorage.setItem('pear_token', token);
+    $('status').textContent = 'as ' + j.user.username + ' (' + j.user.role + ')';
+    $('status').classList.add('ok');
+    refresh();
+  } else {
+    $('status').textContent = 'login failed';
+  }
+}
+async function refresh() {
+  $('health').textContent = JSON.stringify(await (await fetch('/health')).json(), null, 2);
+  if (!token) return;
+  try {
+    $('agents').textContent = JSON.stringify(await (await fetch('/v1/agents', { headers: authHeaders() })).json(), null, 2);
+    $('goals').textContent = JSON.stringify(await (await fetch('/v1/goals', { headers: authHeaders() })).json(), null, 2);
+    $('recs').textContent = JSON.stringify(await (await fetch('/v1/recommendations', { headers: authHeaders() })).json(), null, 2);
+  } catch (e) { console.error(e); }
+}
+async function chat() {
+  const message = $('msg').value;
+  const r = await fetch('/v1/chat', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ message }) });
+  const j = await r.json();
+  $('chat').textContent = JSON.stringify(j, null, 2);
+}
+if (token) { $('status').textContent = 'token restored'; $('status').classList.add('ok'); }
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>
