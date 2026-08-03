@@ -310,8 +310,8 @@ class Orchestrator:
                 parent_task=parent_task,
             )
             result = self.run(task, on_token=on_token, **kwargs)
-            if on_token is not None and result.get("ok"):
-                result["streamed"] = True
+            if on_token is not None:
+                result.setdefault("streamed", False)
             result["trace_id"] = trace.id
             self.tracer.end_trace(trace.id, status="ok" if result.get("ok") else "error")
             return result
@@ -363,7 +363,7 @@ class Orchestrator:
                 single_step=True,
             )
             result = dict(result)
-            result["streamed"] = True
+            result.setdefault("streamed", False)
             result.setdefault("plan_id", graph.plan_id)
             result["trace_id"] = trace.id
             self.last_aggregated = result

@@ -91,14 +91,14 @@ def build_default_registry() -> ToolRegistry:
         t.read_document,
         description="Extract text from a PDF or DOCX file",
         tags=["files", "documents"],
-        requires_permission="read_file",
+        requires_permission="read_document",
     )
     reg.register(
         "summarize_text",
         t.summarize_text,
         description="Produce a short extractive summary of text",
         tags=["files", "nlp"],
-        requires_permission="summarize",
+        requires_permission="summarize_text",
     )
     reg.register(
         "open_application",

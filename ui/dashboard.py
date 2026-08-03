@@ -19,10 +19,10 @@ def show_status(session_id: str = "cli") -> None:
     mem = Memory(session_id=session_id, persist_dir=ROOT / "data")
     print("── PEAR Status ──")
     print(f"Session        : {mem.session_id}")
-    print(f"Messages       : {len(mem.messages)}")
-    print(f"Notes          : {len(mem.notes)}")
-    if mem.messages:
-        last = mem.messages[-1]
+    print(f"Messages       : {len(mem.working.messages)}")
+    print(f"Notes          : {len(mem.knowledge.notes)}")
+    if mem.working.messages:
+        last = mem.working.messages[-1]
         print(f"Last message   : [{last.role}] {last.content[:80]}…")
     print("─────────────────")
 

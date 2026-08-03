@@ -68,28 +68,13 @@ class BaseLLM(ABC):
         if history:
             messages.extend(history)
         messages.append(LLMMessage(role="user", content=user))
-        try:
-            from .tracing import get_tracer
-            tracer = get_tracer()
-            with tracer.span(
-                "llm.generate",
-                kind="llm",
-                provider=getattr(self, "provider", ""),
-                model=getattr(self, "model", ""),
-            ) as sp:
-                resp = self.generate(messages, **kwargs)
-                sp.attributes["model"] = resp.model or getattr(self, "model", "")
-                if resp.usage:
-                    sp.attributes["usage"] = resp.usage
-                return resp
-        except Exception:
-            return self.generate(messages, **kwargs)
+        return self.generate(messages, **kwargs)
 
     def is_available(self) -> bool:
         """Quick health check. Override in subclasses."""
         return True
 
-    def stream(
+    def generate_stream(
         self,
         messages: List[LLMMessage],
         *,
@@ -98,50 +83,31 @@ class BaseLLM(ABC):
         on_token=None,
     ) -> LLMResponse:
         """
-        Stream tokens to on_token(chunk: str) if provided.
-        Default: non-streaming generate, then emit the full text once.
-        Providers may override for real token streaming.
+        Default fallback: no real token streaming – runs generate() and
+        delivers the full text as a single callback. Providers that support
+        real incremental streaming override this.
         """
-        resp = self.generate(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=False,
-        )
-        if on_token and resp.content:
-            on_token(resp.content)
-        return resp
+        response = self.generate(messages, temperature=temperature, max_tokens=max_tokens)
+        if on_token is not None:
+            on_token(response.content)
+        return response
 
     def chat_stream(
         self,
         system: str,
         user: str,
         history: Optional[List[LLMMessage]] = None,
-        *,
         on_token=None,
         **kwargs,
     ) -> LLMResponse:
+        """Convenience: system + optional history + user → streamed response."""
         messages: List[LLMMessage] = []
         if system:
             messages.append(LLMMessage(role="system", content=system))
         if history:
             messages.extend(history)
         messages.append(LLMMessage(role="user", content=user))
-        try:
-            from .tracing import get_tracer
-            tracer = get_tracer()
-            with tracer.span(
-                "llm.stream",
-                kind="llm",
-                provider=getattr(self, "provider", ""),
-                model=getattr(self, "model", ""),
-                stream=True,
-            ) as sp:
-                resp = self.stream(messages, on_token=on_token, **kwargs)
-                sp.attributes["model"] = resp.model or getattr(self, "model", "")
-                return resp
-        except Exception:
-            return self.stream(messages, on_token=on_token, **kwargs)
+        return self.generate_stream(messages, on_token=on_token, **kwargs)
 
 
 # ── Ollama ────────────────────────────────────────────────────────
@@ -215,7 +181,15 @@ class OllamaLLM(BaseLLM):
             },
         )
 
-    def stream(
+    def is_available(self) -> bool:
+        try:
+            req = urllib.request.Request(f"{self.base_url}/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def generate_stream(
         self,
         messages: List[LLMMessage],
         *,
@@ -235,53 +209,41 @@ class OllamaLLM(BaseLLM):
         url = f"{self.base_url}/api/chat"
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+            url, data=data, headers={"Content-Type": "application/json"}, method="POST",
         )
-        pieces: List[str] = []
-        model = self.model
+
+        full_text = []
+        final_body: Dict[str, Any] = {}
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 for raw_line in resp:
-                    line = raw_line.decode("utf-8").strip()
+                    line = raw_line.strip()
                     if not line:
                         continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    token = ""
-                    if "message" in obj:
-                        token = obj["message"].get("content") or ""
-                    elif "response" in obj:
-                        token = obj.get("response") or ""
-                    if token:
-                        pieces.append(token)
-                        if on_token:
-                            on_token(token)
-                    if obj.get("done"):
-                        model = obj.get("model", model)
+                    chunk = json.loads(line.decode("utf-8"))
+                    delta = chunk.get("message", {}).get("content", "")
+                    if delta:
+                        full_text.append(delta)
+                        if on_token is not None:
+                            on_token(delta)
+                    if chunk.get("done"):
+                        final_body = chunk
+                        break
         except urllib.error.URLError as e:
             raise RuntimeError(
-                f"Ollama unreachable at {self.base_url}. "
-                f"Is `ollama serve` running? ({e})"
+                f"Ollama unreachable at {self.base_url}. Is `ollama serve` running? ({e})"
             ) from e
 
         return LLMResponse(
-            content="".join(pieces).strip(),
-            model=model,
+            content="".join(full_text).strip(),
+            model=final_body.get("model", self.model),
             provider=self.provider,
+            raw=final_body,
+            usage={
+                "prompt_eval_count": final_body.get("prompt_eval_count"),
+                "eval_count": final_body.get("eval_count"),
+            },
         )
-
-    def is_available(self) -> bool:
-        try:
-            req = urllib.request.Request(f"{self.base_url}/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
 
     def list_models(self) -> List[str]:
         try:
@@ -357,6 +319,65 @@ class OpenAILLM(BaseLLM):
 
     def is_available(self) -> bool:
         return bool(self.api_key)
+
+    def generate_stream(
+        self,
+        messages: List[LLMMessage],
+        *,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        on_token=None,
+    ) -> LLMResponse:
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY not set")
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [m.to_dict() for m in messages],
+            "temperature": temperature,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+
+        full_text = []
+        model_name = self.model
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload_str = line[len("data:"):].strip()
+                    if payload_str == "[DONE]":
+                        break
+                    chunk = json.loads(payload_str)
+                    model_name = chunk.get("model", model_name)
+                    choices = chunk.get("choices") or [{}]
+                    delta = choices[0].get("delta", {}).get("content", "")
+                    if delta:
+                        full_text.append(delta)
+                        if on_token is not None:
+                            on_token(delta)
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"OpenAI request failed: {e}") from e
+
+        return LLMResponse(
+            content="".join(full_text).strip(),
+            model=model_name,
+            provider=self.provider,
+        )
 
 
 # ── Anthropic ─────────────────────────────────────────────────────
@@ -437,6 +458,75 @@ class AnthropicLLM(BaseLLM):
     def is_available(self) -> bool:
         return bool(self.api_key)
 
+    def generate_stream(
+        self,
+        messages: List[LLMMessage],
+        *,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        on_token=None,
+    ) -> LLMResponse:
+        if not self.api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY not set")
+
+        system = ""
+        chat_msgs = []
+        for m in messages:
+            if m.role == "system":
+                system = m.content
+            else:
+                chat_msgs.append(m.to_dict())
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": chat_msgs,
+            "max_tokens": max_tokens or 2048,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if system:
+            payload["system"] = system
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/messages",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+
+        full_text = []
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload_str = line[len("data:"):].strip()
+                    if not payload_str:
+                        continue
+                    event = json.loads(payload_str)
+                    if event.get("type") == "content_block_delta":
+                        delta = event.get("delta", {}).get("text", "")
+                        if delta:
+                            full_text.append(delta)
+                            if on_token is not None:
+                                on_token(delta)
+                    elif event.get("type") == "message_stop":
+                        break
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Anthropic request failed: {e}") from e
+
+        return LLMResponse(
+            content="".join(full_text).strip(),
+            model=self.model,
+            provider=self.provider,
+        )
+
 
 # ── Fallback (no model) ───────────────────────────────────────────
 
@@ -458,20 +548,17 @@ class EchoLLM(BaseLLM):
     ) -> LLMResponse:
         user = next((m.content for m in reversed(messages) if m.role == "user"), "")
         return LLMResponse(
-            content=self._echo_text(user),
+            content=(
+                f"[echo mode – no LLM connected]\n"
+                f"You said: “{user}”\n"
+                f"Start Ollama (`ollama serve` + `ollama pull llama3.2`) "
+                f"or set OPENAI_API_KEY / ANTHROPIC_API_KEY."
+            ),
             model=self.model,
             provider=self.provider,
         )
 
-    def _echo_text(self, user: str) -> str:
-        return (
-            f"[echo mode – no LLM connected]\n"
-            f"You said: “{user}”\n"
-            f"Start Ollama (`ollama serve` + `ollama pull llama3.2`) "
-            f"or set OPENAI_API_KEY / ANTHROPIC_API_KEY."
-        )
-
-    def stream(
+    def generate_stream(
         self,
         messages: List[LLMMessage],
         *,
@@ -479,15 +566,12 @@ class EchoLLM(BaseLLM):
         max_tokens: Optional[int] = None,
         on_token=None,
     ) -> LLMResponse:
-        user = next((m.content for m in reversed(messages) if m.role == "user"), "")
-        text = self._echo_text(user)
-        # Emit word-ish chunks so callers see multiple tokens
-        if on_token:
-            parts = text.split(" ")
-            for i, part in enumerate(parts):
-                chunk = part if i == len(parts) - 1 else part + " "
-                on_token(chunk)
-        return LLMResponse(content=text, model=self.model, provider=self.provider)
+        response = self.generate(messages, temperature=temperature, max_tokens=max_tokens)
+        if on_token is not None:
+            words = response.content.split(" ")
+            for i, word in enumerate(words):
+                on_token(word if i == 0 else " " + word)
+        return response
 
 
 # ── Factory ───────────────────────────────────────────────────────
