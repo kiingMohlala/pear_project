@@ -5,6 +5,7 @@ Uses the shared LLM abstraction + knowledge retrieval.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .base import Agent
@@ -39,6 +40,55 @@ class PersonalAgent(Agent):
     def can_handle(self, task: Task) -> float:
         base = super().can_handle(task)
         return max(base, 0.2)
+
+    def handle_file_upload(self, path: str) -> Dict[str, Any]:
+        """
+        Read + summarize an uploaded document, then store it in the
+        knowledge store. ui/app.py used to call core.tools functions
+        directly for this, bypassing the agent, the registry's permission
+        checks, and event logging entirely. Routing it through use_tool()
+        closes that gap.
+        """
+        from core.events import EventType
+
+        task = Task(objective=f"Upload and summarize file: {path}")
+        task.assign(self.name)
+        if self.planner is not None:
+            self.planner.task_log.append(task)
+        self._emit(EventType.TASK_CREATED, {"task_id": task.id, "objective": task.objective})
+        task.start()
+        self._emit(EventType.TASK_STARTED, {
+            "task_id": task.id, "agent": self.name, "objective": task.objective,
+        })
+
+        try:
+            text = self.use_tool("read_document", path)
+        except Exception as e:
+            error = str(e)
+            task.fail(error)
+            self._emit(EventType.TASK_FAILED, {"task_id": task.id, "error": error})
+            return {"ok": False, "error": error, "task_id": task.id}
+
+        self.memory.knowledge.add_document(name=Path(path).name, text=text, source_path=str(path))
+        self.memory._save()
+
+        try:
+            summary = self.use_tool("summarize_text", text)
+        except Exception as e:
+            summary = f"(summary unavailable: {e})"
+
+        response = {
+            "ok": True,
+            "reply": summary,
+            "name": Path(path).name,
+            "chars": len(text),
+            "task_id": task.id,
+        }
+        task.complete(response)
+        self._emit(EventType.TASK_COMPLETED, {
+            "task_id": task.id, "agent": self.name, "reply_preview": summary[:120],
+        })
+        return response
 
     def _process(self, task: Task, **kwargs) -> Dict[str, Any]:
         user_input = task.objective

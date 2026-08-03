@@ -13,7 +13,6 @@ if str(ROOT) not in sys.path:
 
 from core.memory import Memory
 from core.orchestrator import Orchestrator
-from core.tools import read_document, summarize_text
 from core.llm import create_llm
 from agents import PersonalAgent, DesktopAgent, FinanceAgent, LegalAgent, BrowserAgent, ResearchAgent, ComputerUseAgent, EmailAgent, CalendarAgent, ReviewerAgent, CriticAgent
 
@@ -43,21 +42,20 @@ def handle_file_upload(orch: Orchestrator, path_str: str) -> None:
     if not path.exists():
         print(f"  ✗ File not found: {path}")
         return
-    try:
-        text = read_document(path)
-        summary = summarize_text(text)
-        orch.memory.knowledge.add_document(
-            name=path.name,
-            text=text,
-            source_path=str(path),
-        )
-        orch.memory._save()
-        print(f"\n  📄 {path.name} loaded ({len(text)} chars) → knowledge store")
-        print("  ── Summary ──")
-        print(summary)
-        print()
-    except Exception as e:
-        print(f"  ✗ Failed to read document: {e}")
+    personal = orch.agents.get("personal")
+    if personal is None:
+        print("  ✗ No personal agent registered.")
+        return
+
+    result = personal.handle_file_upload(str(path))
+    if not result.get("ok"):
+        print(f"  ✗ Failed to read document: {result.get('error')}")
+        return
+
+    print(f"\n  📄 {result['name']} loaded ({result['chars']} chars) → knowledge store")
+    print("  ── Summary ──")
+    print(result["reply"])
+    print()
 
 
 def print_banner():
