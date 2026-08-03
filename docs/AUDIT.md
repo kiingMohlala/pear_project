@@ -26,37 +26,34 @@ overwrite when the destination file already exists and differs. Not fixed yet.
 
 ---
 
-## 🔴 `ui/dashboard.py` — AttributeError on `mem.messages` / `mem.notes`
+## 🟡 Action layer (`core/action.py`) still doesn't exist here
 
-Fixed in an earlier session, then reverted when v2.30 merged over the older
-base. `Memory` only exposes `mem.working.messages` / `mem.knowledge.notes`;
-`dashboard.py` reads `mem.messages` / `mem.notes` directly.
-
-```
-AttributeError: 'Memory' object has no attribute 'messages'
-```
-
-Needs the same two-line fix as before. Not yet re-applied to this tree.
+The file-upload fix above uses `use_tool()` directly (the only tool-access
+path that actually exists in this tree) rather than the Action-layer
+(`ReadDocumentAction`/`ActionExecutor`/retries/audit trail) built in an
+earlier session — that layer never made it into v2.30 at all. Needs a
+decision: rebuild it against the current `core/executor.py`/
+`core/task_graph.py`, or confirm those already cover the same ground
+(retries, structured execution tracking) and the Action layer is redundant.
 
 ---
 
-## 🔴 `ui/app.py` file upload bypasses agents/registry entirely
+## 🟡 `open_application` is permission-denied by default — needs a decision, not a silent fix
 
-Also reverted. `handle_file_upload()` imports `read_document`/`summarize_text`
-from `core.tools` and calls them directly — no agent, no permission check, no
-audit trail. Contradicts the "agents create actions, not raw tool calls"
-principle from the Action-layer work. That whole layer (`core/action.py`) is
-absent from this tree — needs a decision: rebuild it against the current
-`core/executor.py`/`core/task_graph.py`, or confirm those already cover the
-same ground and the Action layer is redundant.
+Same root cause as the permission bug below, but I didn't touch this one:
+`open_application` requires permission key `"open_app"`, which isn't in
+`Permissions`' default grant set, and its `policies` entry is `"confirm"` —
+that looks deliberate (launching arbitrary desktop apps probably *should*
+need confirmation, unlike reading/summarizing a file). Right now there's no
+actual confirm-flow wired up though, so in practice it's just permanently
+blocked with no path to grant it. Needs a real decision: build the confirm
+flow, or grant it by default like read/summarize were supposed to be.
 
 ---
 
-## 🟡 6 failing tests — not yet root-caused
+## 🟡 6 failing tests — 4 remain, root cause found for the other 2
 
 ```
-test_eval_v120.py::test_isolation_temp_state              TypeError
-test_media_v100.py::test_media_manager_indexes_knowledge   TypeError
 test_plugins_v110.py::test_discover_builtin_plugins        AssertionError
 test_plugins_v110.py::test_load_weather_registers_tool_and_command
 test_plugins_v110.py::test_disable_enable                  KeyError: unknown plugin 'notion'
@@ -65,6 +62,10 @@ test_plugins_v110.py::test_notion_registers_connector_when_enabled
 
 The plugin ones look related — `PluginManager.discover()` isn't finding the
 `notion` plugin at all, which would explain all four. Not dug into yet.
+
+(`test_eval_v120::test_isolation_temp_state` and
+`test_media_v100::test_media_manager_indexes_knowledge` turned out to be the
+same permission-key bug as below — fixed as a side effect, not separately.)
 
 ---
 
@@ -79,6 +80,18 @@ The plugin ones look related — `PluginManager.discover()` isn't finding the
   `orchestrator.py` also force-set `streamed: True` regardless of outcome.
   Both fixed in `8aa32f1`: real `chat_stream`/`generate_stream` on all four
   LLM providers, and the flag now reflects what actually happened.
+- **`ui/dashboard.py` crash** — `mem.messages`/`mem.notes` don't exist on the
+  `Memory` facade. Fixed in `ba3e67a`.
+- **`ui/app.py` file upload bypassed agents/registry** — fixed in `ba3e67a`
+  via `PersonalAgent.handle_file_upload()`, routed through `use_tool()`.
+- **`read_document`/`summarize_text` permission-key mismatch** — found while
+  testing the file-upload fix, not going in blind: both tools required
+  permission keys (`read_file`, `summarize`) that don't exist anywhere in
+  `Permissions`' default grant set, which grants `read_document`/
+  `summarize_text` by tool name — matching the convention every other tool
+  in the registry already follows. Every call to either tool was silently
+  permission-denied by default, regardless of caller. Fixed in `ba3e67a`;
+  also fixed two of the "not yet diagnosed" test failures as a side effect.
 
 ---
 
