@@ -1,3 +1,19 @@
+# PEAR 3.0.0-rc1
+
+Personal AI platform: multi-agent planning, memory, goals, workers, and multi-user API.
+
+## Quick start
+
+```bash
+pip install -r requirements.txt
+python -m ui.app
+# or
+python -m service.app
+```
+
+Docs: `docs/ARCHITECTURE.md`, `docs/DEPLOYMENT.md`, `docs/USER_GUIDE.md`, `docs/RELEASE_CHECKLIST.md`
+
+
 # PEAR – Personal Agent Runtime
 
 Lightweight multi-agent personal assistant scaffold.

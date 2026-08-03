@@ -264,6 +264,30 @@ class WorkerManager:
             self._emit("worker_disabled", worker_id=worker_id)
             return w
 
+    def quarantine(self, worker_id: str, reason: str = "repeated failures") -> WorkerInfo:
+        with self._lock:
+            w = self._require(worker_id)
+            w.status = WorkerStatus.DISABLED
+            w.meta["quarantined"] = True
+            w.meta["quarantine_reason"] = reason
+            w.meta["quarantined_at"] = time.time()
+            self._emit("worker_quarantined", worker_id=worker_id, reason=reason)
+            return w
+
+    def maybe_quarantine(self, worker_id: str, threshold: int = 5) -> bool:
+        """Quarantine worker if consecutive/total failures exceed threshold."""
+        with self._lock:
+            w = self._require(worker_id)
+            fails = int(w.total_failed)
+            if fails >= threshold and not w.meta.get("quarantined"):
+                w.status = WorkerStatus.DISABLED
+                w.meta["quarantined"] = True
+                w.meta["quarantine_reason"] = f"failures>={threshold}"
+                w.meta["quarantined_at"] = time.time()
+                self._emit("worker_quarantined", worker_id=worker_id, failures=fails)
+                return True
+            return False
+
     def drain(self, worker_id: str) -> WorkerInfo:
         """Stop accepting new tasks; finish in-flight."""
         with self._lock:
@@ -415,6 +439,10 @@ class WorkerManager:
                 self.metrics["failed"] += 1
             with self._lock:
                 worker.total_failed += 1
+            try:
+                self.maybe_quarantine(worker.id)
+            except Exception:
+                pass
             # retry
             if rec.attempts < rec.max_attempts:
                 rec.status = DispatchStatus.RETRYING

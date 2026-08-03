@@ -10,6 +10,7 @@ Agents never call each other; collaboration is only via planner subtasks.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .memory import Memory
@@ -33,6 +34,11 @@ from .collaboration import CollaborationManager
 from .goals import GoalManager
 from .learning import LearningEngine
 from .workers import WorkerManager
+from .config import get_config
+from .audit import AuditLog
+from .ratelimit import RateLimiter
+from .backup import BackupManager
+from .logging_util import setup_logging, get_logger, new_correlation_id
 from .memory_intelligence import MemoryIntelligence
 
 
@@ -113,6 +119,21 @@ class Orchestrator:
         self.goals = GoalManager(self)
         self.learning = LearningEngine(self)
         self.workers = WorkerManager(self)
+        _cfg = get_config()
+        setup_logging(_cfg.get("log_level", "INFO"), json_mode=bool(_cfg.get("log_json")))
+        self.logger = get_logger("pear.orchestrator")
+        self.audit = AuditLog(
+            path=Path(str(_cfg.get("data_dir"))) / "audit.jsonl",
+            enabled=bool(_cfg.get("audit_enabled", True)),
+        )
+        self.rate_limiter = RateLimiter(
+            per_minute=int(_cfg.get("rate_limit_per_minute", 120)),
+            burst=int(_cfg.get("rate_limit_burst", 30)),
+        )
+        self.backups = BackupManager(
+            Path(str(_cfg.get("data_dir"))),
+            backup_dir=Path(str(_cfg.get("backup_dir"))),
+        )
         self.memory_intel = getattr(self.memory, "intelligence", None) or MemoryIntelligence(self.memory)
         if getattr(self.memory, "intelligence", None) is None:
             self.memory.intelligence = self.memory_intel
@@ -150,6 +171,19 @@ class Orchestrator:
         ]
 
     # ── legacy single-task plan (kept for tests / direct use) ─────
+
+
+    def learned_agent_bonus(self, agent_name: str) -> float:
+        """Optional soft bias from LearningEngine (v3.1). Off by default."""
+        try:
+            from .config import get_config
+            if not get_config().get("planner_use_learned_bias"):
+                return 0.0
+            bias = self.learning.planner_agent_bias()
+            return float(bias.get(agent_name, 0.0)) * 0.05  # small nudge only
+        except Exception:
+            return 0.0
+
 
     def plan(
         self,

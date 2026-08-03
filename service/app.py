@@ -19,6 +19,10 @@ from urllib.parse import parse_qs, urlparse
 
 from .auth import AuthManager, Role
 from .sessions import SessionManager
+from core.ratelimit import RateLimiter
+from core.audit import AuditLog
+from core.config import get_config
+from core.logging_util import new_correlation_id, set_correlation_id, bind_context
 
 START_TIME = time.time()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -41,6 +45,12 @@ class PearService:
         root.mkdir(parents=True, exist_ok=True)
         self.auth = AuthManager(persist_path=root / "users.json")
         self.sessions = SessionManager(data_root=root / "sessions")
+        cfg = get_config()
+        self.rate_limiter = RateLimiter(
+            per_minute=int(cfg.get("rate_limit_per_minute", 120)),
+            burst=int(cfg.get("rate_limit_burst", 30)),
+        )
+        self.audit = AuditLog(path=root / "audit.jsonl", enabled=bool(cfg.get("audit_enabled", True)))
         self.metrics = {
             "requests": 0,
             "errors": 0,
@@ -54,6 +64,16 @@ class PearService:
     def handle_route(self, method: str, path: str, headers: Dict[str, str], body: bytes) -> tuple:
         self.metrics["requests"] += 1
         try:
+            cid = new_correlation_id()
+            set_correlation_id(cid)
+            user = self.user_from_headers(headers)
+            key = (user.username if user else "anon") + ":" + path
+            if path.startswith("/v1") or path.startswith("/admin"):
+                ok, info = self.rate_limiter.allow(key)
+                if not ok:
+                    self.metrics["errors"] += 1
+                    self.audit.record("rate_limited", actor=user.username if user else "anon", resource=path, outcome="deny", correlation_id=cid)
+                    return 429, {"ok": False, "error": "rate limit exceeded", **info}
             return self._dispatch(method, path, headers, body)
         except PermissionError as e:
             self.metrics["errors"] += 1
@@ -91,7 +111,9 @@ class PearService:
         if path == "/auth/login" and method == "POST":
             user = self.auth.authenticate(data.get("username", ""), data.get("password", ""))
             if not user:
+                self.audit.record("login", actor=data.get("username", ""), outcome="fail")
                 return 401, {"ok": False, "error": "invalid credentials"}
+            self.audit.record("login", actor=user.username, outcome="ok")
             return 200, {"ok": True, "token": user.token, "user": user.to_public()}
 
         # dashboard static

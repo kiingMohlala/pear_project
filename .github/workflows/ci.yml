@@ -1,0 +1,29 @@
+name: PEAR CI
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+      - name: Migrate sample data
+        run: python -c "from pathlib import Path; from core.version import migrate_data_dir; print(migrate_data_dir(Path('/tmp/pear_ci')))"
+      - name: Regression
+        env:
+          PEAR_PROFILE: testing
+          PEAR_SPEECH_PROVIDER: offline
+          PEAR_VISION_PROVIDER: offline
+          PEAR_TTS_PROVIDER: offline
+          PEAR_COMPUTER_BACKEND: sim
+        run: python ci/run_regression.py

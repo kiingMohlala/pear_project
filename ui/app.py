@@ -66,7 +66,7 @@ def print_banner():
 ╔══════════════════════════════════════╗
 ║              P E A R                 ║
 ║     Personal Agent Runtime           ║
-║              v2.30                   ║
+║              v2.35                   ║
 ╚══════════════════════════════════════╝
   Type a message, or:
     /file <path>   – upload & summarize PDF/DOCX
@@ -827,6 +827,52 @@ def main() -> None:
             continue
         if user.lower().startswith("/disable-worker "):
             print(orch.workers.disable(user.split(maxsplit=1)[1].strip()).to_dict())
+            continue
+
+
+        if user.lower() == "/config":
+            from core.config import get_config
+            print(get_config().as_dict())
+            continue
+        if user.lower() == "/diagnostics":
+            from core.ops import diagnostics
+            print(diagnostics(orch))
+            continue
+        if user.lower() == "/backup" or user.lower().startswith("/backup "):
+            label = user.split(maxsplit=1)[1] if " " in user else "manual"
+            print(orch.backups.create(label=label))
+            continue
+
+
+        if user.lower() in ("/n8n",):
+            try:
+                r = orch.connectors.execute("n8n", "status")
+                print(r.to_dict() if hasattr(r, "to_dict") else r)
+            except Exception as e:
+                print("  n8n:", e)
+            continue
+        if user.lower() in ("/n8n-workflows",):
+            try:
+                r = orch.connectors.execute("n8n", "list_workflows")
+                print(r.to_dict() if hasattr(r, "to_dict") else r)
+            except Exception as e:
+                print("  n8n:", e)
+            continue
+        if user.lower().startswith("/run-n8n "):
+            wid = user.split(maxsplit=1)[1].strip()
+            try:
+                r = orch.connectors.execute("n8n", "execute_workflow", workflow_id=wid)
+                print(r.to_dict() if hasattr(r, "to_dict") else r)
+            except Exception as e:
+                print("  n8n:", e)
+            continue
+        if user.lower().startswith("/n8n-status "):
+            eid = user.split(maxsplit=1)[1].strip()
+            try:
+                r = orch.connectors.execute("n8n", "get_execution_status", execution_id=eid)
+                print(r.to_dict() if hasattr(r, "to_dict") else r)
+            except Exception as e:
+                print("  n8n:", e)
             continue
 
         if user.lower() == "/tasks":

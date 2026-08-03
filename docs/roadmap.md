@@ -213,13 +213,48 @@
 - Docker + Compose; `/health` `/ready` `/metrics`
 - CLI remains process-local; same Orchestrator core
 
-## v2.30 (current) — Distributed Worker Runtime
+## v2.30 — Distributed Worker Runtime
 - WorkerManager: register, heartbeat, drain/enable/disable
 - Capability routing (gpu, browser, desktop, research, finance, legal, …)
 - Dispatch protocol: ack, retry, timeout recovery
 - Local thread pool + remote HTTP workers
 - Metrics: dispatch latency, queue time, utilization
 - CLI: /workers /worker-status /drain-worker /enable-worker /disable-worker
+
+## v2.35 — Optional n8n Connector
+- N8NConnector (webhook + REST), disabled by default
+- Actions: list/execute workflows, execution status, cancel, callbacks
+- CredentialStore API key / bearer auth
+- CLI: /n8n /n8n-workflows /run-n8n /n8n-status
+- Offline mocked tests
+
+## v2.40 — Operations & Production Hardening
+- Config profiles: development / testing / production
+- Structured logging + correlation IDs
+- Backup/restore + checksum verification
+- Rate limiting, audit log, resource metrics
+- Worker quarantine after repeated failures
+- Admin CLI: scripts/admin_cli.py
+- CLI: /backup /diagnostics /config
+
+## v3.00 — Release Candidate
+- Public API freeze + schema migration
+- Architecture / developer / deployment / user docs
+- E2E + performance suites, security review
+- CI workflow + release checklist
+- Config templates & packaging
+
+## v3.0.0 (stable)
+- Production validation complete (docs/VALIDATION_REPORT_v3.md)
+- Public APIs frozen; schema version 3
+- Published docs, CI, Docker packaging
+
+## v3.1 (current) — Ecosystem & Maturity
+- Roadmap: docs/ROADMAP_v3.1.md
+- Optional connectors: Slack, Notion, Google Drive, Jira (disabled by default)
+- Tutorials + sample workflows
+- Opt-in planner learned bias (`planner_use_learned_bias`)
+- Strict v3.0 API compatibility
 
 ## v0.5
 - Desktop Vision (screen understanding)
