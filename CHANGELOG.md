@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.10.0
+
+- Controlled RSI: SelfImprovementEngine, proposals, scorecards, sandbox validation
+- Auto-reject on regression; human approval before deploy
+- CLI self-improve commands; reversible config-parameter changes only
+
 ## 3.1.0 (planning / scaffolding)
 
 - v3.1 roadmap (ecosystem, optimization, clients)

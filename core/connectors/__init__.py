@@ -10,6 +10,7 @@ from .slack_connector import SlackConnector
 from .notion_connector import NotionConnector
 from .gdrive_connector import GoogleDriveConnector
 from .jira_connector import JiraConnector
+from .quant_connector import QuantConnector
 
 
 def build_default_connectors(workspace=None) -> ConnectorRegistry:
@@ -24,6 +25,7 @@ def build_default_connectors(workspace=None) -> ConnectorRegistry:
     reg.register(NotionConnector())
     reg.register(GoogleDriveConnector())
     reg.register(JiraConnector())
+    reg.register(QuantConnector())
     return reg
 
 
@@ -44,4 +46,5 @@ __all__ = [
     "NotionConnector",
     "SlackConnector",
     "build_default_connectors",
+    "QuantConnector",
 ]

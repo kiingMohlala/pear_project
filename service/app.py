@@ -18,6 +18,15 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 from .auth import AuthManager, Role
+try:
+    from core.beta import BetaManager
+except Exception:  # optional — not shipped in some builds
+    BetaManager = None  # type: ignore
+from core.security import (
+    sanitize_object, validate_body_size, DEFAULT_MAX_BODY,
+    check_upload_bytes, safe_upload_path,
+    apply_cors_headers, cors_allowed_origins,
+)
 from .sessions import SessionManager
 from core.ratelimit import RateLimiter
 from core.audit import AuditLog
@@ -33,13 +42,18 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: Any) -
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+    origin = handler.headers.get("Origin") or ""
+    apply_cors_headers(handler.send_header, origin)
     handler.end_headers()
     handler.wfile.write(body)
 
 
 class PearService:
+    def _require_beta(self):
+        if not self.beta:
+            return 501, {"ok": False, "error": "beta program not installed in this build"}
+        return None
+
     def __init__(self, data_root: Optional[Path] = None):
         root = Path(data_root) if data_root else Path(os.environ.get("PEAR_DATA", str(Path.home() / ".pear")))
         root.mkdir(parents=True, exist_ok=True)
@@ -51,6 +65,7 @@ class PearService:
             burst=int(cfg.get("rate_limit_burst", 30)),
         )
         self.audit = AuditLog(path=root / "audit.jsonl", enabled=bool(cfg.get("audit_enabled", True)))
+        self.beta = BetaManager(persist_dir=root / "beta") if BetaManager else None
         self.metrics = {
             "requests": 0,
             "errors": 0,
@@ -64,6 +79,7 @@ class PearService:
     def handle_route(self, method: str, path: str, headers: Dict[str, str], body: bytes) -> tuple:
         self.metrics["requests"] += 1
         try:
+            validate_body_size(body)
             cid = new_correlation_id()
             set_correlation_id(cid)
             user = self.user_from_headers(headers)
@@ -92,7 +108,8 @@ class PearService:
         data = {}
         if body:
             try:
-                data = json.loads(body.decode("utf-8"))
+                # size already checked
+                data = sanitize_object(json.loads(body.decode("utf-8")))
             except Exception:
                 data = {}
 
@@ -109,16 +126,53 @@ class PearService:
             }
 
         if path == "/auth/login" and method == "POST":
-            user = self.auth.authenticate(data.get("username", ""), data.get("password", ""))
+            username = str(data.get("username") or "")
+            ok_rl, info = self.rate_limiter.allow(f"auth:{username or 'anon'}")
+            if not ok_rl:
+                self.audit.record("login", actor=username, outcome="rate_limited", detail=info)
+                return 429, {"ok": False, "error": "too many login attempts", **info}
+            status = self.auth.login_status(username)
+            if status.get("locked"):
+                self.audit.record("login", actor=username, outcome="locked", detail=status)
+                return 423, {"ok": False, "error": "account temporarily locked", "retry_after_s": status.get("retry_after_s", 0)}
+            user = self.auth.login(username, data.get("password") or "")
             if not user:
-                self.audit.record("login", actor=data.get("username", ""), outcome="fail")
-                return 401, {"ok": False, "error": "invalid credentials"}
+                self.audit.record("login", actor=username, outcome="fail")
+                st = self.auth.login_status(username)
+                return 401, {"ok": False, "error": "invalid credentials", "locked": st.get("locked"), "retry_after_s": st.get("retry_after_s", 0)}
             self.audit.record("login", actor=user.username, outcome="ok")
-            return 200, {"ok": True, "token": user.token, "user": user.to_public()}
+            return 200, {"ok": True, "token": user.token, "user": user.to_public(), "expires_hint_s": getattr(self.auth, "token_ttl_s", 43200)}
+
+        if path == "/auth/logout" and method == "POST":
+            # resolve user from header before require (user may not be set yet in this branch)
+            user = self.user_from_headers(headers)
+            self.auth.require(user, Role.USER, Role.ADMIN, Role.API_CLIENT)
+            tok = headers.get("Authorization") or headers.get("authorization") or ""
+            self.auth.revoke_token(tok)
+            self.audit.record("logout", actor=user.username, outcome="ok")
+            return 200, {"ok": True}
+
 
         # dashboard static
         if path in ("/", "/dashboard") and method == "GET":
             return 200, {"_html": (STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")}
+        if path == "/beta" and method == "GET":
+            p = STATIC_DIR / "beta_activate.html"
+            if not p.exists() or not self.beta:
+                return 404, {"ok": False, "error": "beta program not installed"}
+            return 200, {"_html": p.read_text(encoding="utf-8")}
+        if path == "/beta/feedback" and method == "GET":
+            p = STATIC_DIR / "beta_feedback.html"
+            if not p.exists() or not self.beta:
+                return 404, {"ok": False, "error": "beta program not installed"}
+            return 200, {"_html": p.read_text(encoding="utf-8")}
+        if path == "/admin/beta" and method == "GET":
+            p = STATIC_DIR / "beta_admin.html"
+            if not p.exists() or not self.beta:
+                return 404, {"ok": False, "error": "beta program not installed"}
+            return 200, {"_html": p.read_text(encoding="utf-8")}
+        if path == "/quant/paper" and method == "GET":
+            return 200, {"_html": (STATIC_DIR / "quant_paper.html").read_text(encoding="utf-8")}
 
         user = self.user_from_headers(headers)
         if path.startswith("/admin"):
@@ -128,10 +182,71 @@ class PearService:
             self.auth.require(user, Role.USER, Role.ADMIN, Role.API_CLIENT)
             return 200, {"ok": True, "user": user.to_public()}
 
+        # public beta activation (no auth — key is the credential)
+        if path == "/v1/beta/activate" and method == "POST":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            account = data.get("account") or (user.username if user else "")
+            if not account:
+                return 400, {"ok": False, "error": "account required"}
+            result = self.beta.activate(
+                data.get("code") or "",
+                account=account,
+                device_id=str(data.get("device_id") or "unknown"),
+                platform=str(data.get("platform") or "mobile"),
+                app_version=str(data.get("app_version") or "3.0.0"),
+            )
+            self.audit.record(
+                "beta_activate",
+                actor=account,
+                outcome="ok" if result.get("ok") else "fail",
+                detail={"code_prefix": str(data.get("code") or "")[:9]},
+            )
+            return (200 if result.get("ok") else 400), result
+
+        if path == "/v1/beta/status" and method == "POST":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            account = data.get("account") or (user.username if user else "")
+            result = self.beta.check_access(
+                account or "",
+                str(data.get("device_id") or ""),
+                platform=str(data.get("platform") or ""),
+                app_version=str(data.get("app_version") or ""),
+            )
+            return 200, result
+
         # authenticated API
         self.auth.require(user, Role.USER, Role.ADMIN, Role.API_CLIENT)
         sess = self.sessions.get(user.username)
         orch = sess.orchestrator
+
+
+        if path == "/v1/upload" and method == "POST":
+            # base64 body: {"filename": "...", "content_b64": "..."}
+            import base64
+            fname = str(data.get("filename") or "upload.bin")
+            try:
+                raw = base64.b64decode(data.get("content_b64") or "")
+                check_upload_bytes(raw, fname)
+                ws = Path(self.sessions.data_root) / user.username / "uploads"
+                ws.mkdir(parents=True, exist_ok=True)
+                dest = safe_upload_path(ws, fname)
+                dest.write_bytes(raw)
+            except Exception as e:
+                self.audit.record("upload_denied", actor=user.username, outcome="fail", detail={"error": str(e)})
+                return 400, {"ok": False, "error": str(e)}
+            self.audit.record("upload", actor=user.username, outcome="ok", detail={"file": dest.name, "size": len(raw)})
+            return 200, {"ok": True, "path": str(dest), "size": len(raw)}
+
+
+        if path == "/v1/quant/paper/dashboard" and method == "GET":
+            eng = getattr(self, "_paper_engine", None)
+            if eng is None:
+                return 200, {"ok": True, "active": 0, "rankings": [], "note": "no paper engine attached"}
+            return 200, {"ok": True, **eng.dashboard_data()}
 
         if path == "/v1/chat" and method == "POST":
             message = data.get("message") or data.get("text") or ""
@@ -254,6 +369,123 @@ class PearService:
                 pass
             return 200, {"ok": True, "report": report.to_dict()}
 
+
+        # ── beta program ──────────────────────────────────────────
+        if path == "/v1/beta/activate" and method == "POST":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            account = data.get("account") or (user.username if user else "")
+            if not account:
+                return 400, {"ok": False, "error": "account required"}
+            result = self.beta.activate(
+                data.get("code") or "",
+                account=account,
+                device_id=str(data.get("device_id") or "unknown"),
+                platform=str(data.get("platform") or "mobile"),
+                app_version=str(data.get("app_version") or "3.0.0"),
+            )
+            self.audit.record(
+                "beta_activate",
+                actor=account,
+                outcome="ok" if result.get("ok") else "fail",
+                detail={"code_prefix": str(data.get("code") or "")[:9]},
+            )
+            return (200 if result.get("ok") else 400), result
+
+        if path == "/v1/beta/status" and method == "POST":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            account = data.get("account") or (user.username if user else "")
+            result = self.beta.check_access(
+                account or "",
+                str(data.get("device_id") or ""),
+                platform=str(data.get("platform") or ""),
+                app_version=str(data.get("app_version") or ""),
+            )
+            return 200, result
+
+        if path == "/v1/beta/consent" and method == "POST":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            self.auth.require(user, Role.USER, Role.ADMIN, Role.API_CLIENT)
+            self.beta.set_consent(user.username, bool(data.get("diagnostics")))
+            return 200, {"ok": True, "diagnostics": self.beta.has_consent(user.username)}
+
+        if path == "/v1/beta/feedback" and method == "POST":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            self.auth.require(user, Role.USER, Role.ADMIN, Role.API_CLIENT)
+            entry = self.beta.submit_feedback(
+                user.username,
+                data.get("message") or "",
+                rating=int(data.get("rating") or 3),
+                category=str(data.get("category") or "general"),
+                include_diagnostics=bool(data.get("include_diagnostics")),
+                diagnostics=data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {},
+                key_id=data.get("key_id"),
+            )
+            return 200, {"ok": True, "feedback": entry.to_dict()}
+
+        if path == "/v1/beta/telemetry" and method == "POST":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            self.auth.require(user, Role.USER, Role.ADMIN, Role.API_CLIENT)
+            ev = self.beta.record_telemetry(
+                user.username,
+                str(data.get("event_type") or "error"),
+                data.get("payload") if isinstance(data.get("payload"), dict) else {},
+            )
+            if ev is None:
+                return 200, {"ok": False, "error": "diagnostics consent required"}
+            return 200, {"ok": True, "event_id": ev.id}
+
+        if path == "/admin/beta/keys" and method == "GET":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            self.auth.require(user, Role.ADMIN)
+            return 200, {"ok": True, "keys": self.beta.list_keys(), "stats": self.beta.stats()}
+
+        if path == "/admin/beta/keys" and method == "POST":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            self.auth.require(user, Role.ADMIN)
+            count = int(data.get("count") or 1)
+            ttl = int(data.get("ttl_days") or 30)
+            keys = self.beta.create_keys(count, ttl_days=ttl, label_prefix=str(data.get("label_prefix") or ""))
+            self.audit.record("beta_create_keys", actor=user.username, detail={"count": count})
+            return 200, {"ok": True, "keys": [k.to_dict() for k in keys]}
+
+        if path == "/admin/beta/revoke" and method == "POST":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            self.auth.require(user, Role.ADMIN)
+            key = self.beta.revoke(data.get("key_id") or "", reason=str(data.get("reason") or "admin"))
+            self.audit.record("beta_revoke", actor=user.username, resource=key.id)
+            return 200, {"ok": True, "key": key.to_dict()}
+
+        if path == "/admin/beta/extend" and method == "POST":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            self.auth.require(user, Role.ADMIN)
+            key = self.beta.extend(data.get("key_id") or "", extra_days=int(data.get("days") or 30))
+            return 200, {"ok": True, "key": key.to_dict()}
+
+        if path == "/admin/beta/feedback" and method == "GET":
+            _b = self._require_beta()
+            if _b:
+                return _b
+            self.auth.require(user, Role.ADMIN)
+            return 200, {"ok": True, "feedback": [f.to_dict() for f in self.beta.feedback[-100:]]}
+
         if path == "/admin/sessions" and method == "GET":
             return 200, {"ok": True, "sessions": self.sessions.list_sessions()}
 
@@ -278,9 +510,8 @@ def make_handler(service: PearService):
         def _handle(self, method: str):
             if method == "OPTIONS":
                 self.send_response(204)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+                origin = self.headers.get("Origin") or ""
+                apply_cors_headers(self.send_header, origin)
                 self.end_headers()
                 return
             status, payload = service.handle_route(method, self.path, self._headers_dict(), self._read_body())
@@ -289,6 +520,7 @@ def make_handler(service: PearService):
                 self.send_response(status)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                apply_cors_headers(self.send_header, self.headers.get("Origin") or "")
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -317,11 +549,15 @@ def create_app(data_root: Optional[Path] = None):
 
     service = PearService(data_root=data_root)
     app = FastAPI(title="PEAR API", version="2.20")
+    origins = cors_allowed_origins()
+    # FastAPI: empty list would block all; use same-origin only by not reflecting *
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=origins if origins else [],
+        allow_credentials=bool(origins) and origins != ["*"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Requested-With", "Accept", "Origin"],
+        max_age=600,
     )
     app.state.service = service
 
@@ -345,10 +581,20 @@ def create_app(data_root: Optional[Path] = None):
 
     @app.post("/auth/login")
     def login(payload: dict):
-        user = service.auth.authenticate(payload.get("username", ""), payload.get("password", ""))
+        username = str(payload.get("username") or "")
+        st = service.auth.login_status(username)
+        if st.get("locked"):
+            raise HTTPException(423, "account temporarily locked")
+        user = service.auth.login(username, payload.get("password") or "")
         if not user:
             raise HTTPException(401, "invalid credentials")
         return {"ok": True, "token": user.token, "user": user.to_public()}
+
+    @app.post("/auth/logout")
+    def logout(authorization: Optional[str] = Header(None)):
+        user = user_dep(authorization)
+        service.auth.revoke_token(authorization or "")
+        return {"ok": True}
 
     @app.get("/", response_class=HTMLResponse)
     @app.get("/dashboard", response_class=HTMLResponse)

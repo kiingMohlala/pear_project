@@ -109,6 +109,22 @@ class CredentialStore:
     def list_connectors(self) -> list:
         return sorted(self._data.keys())
 
+    def rotate_key(self) -> Dict[str, Any]:
+        """Generate new key and re-encrypt store (key rotation)."""
+        old_key = self._key
+        new_key = hashlib.sha256(os.urandom(32)).digest()
+        # decrypt with old
+        data = dict(self._data)
+        self._key = new_key
+        self.key_path.write_bytes(new_key)
+        try:
+            os.chmod(self.key_path, 0o600)
+        except OSError:
+            pass
+        self._data = data
+        self._save()
+        return {"ok": True, "encryption": "fernet" if self._fernet() else "xor-dev"}
+
     def status(self) -> Dict[str, Any]:
         return {
             "path": str(self.path),

@@ -33,6 +33,7 @@ from .voice import VoiceAssistant
 from .collaboration import CollaborationManager
 from .goals import GoalManager
 from .learning import LearningEngine
+from .self_improve import SelfImprovementEngine
 from .workers import WorkerManager
 from .config import get_config
 from .audit import AuditLog
@@ -118,6 +119,7 @@ class Orchestrator:
         self.collaboration = CollaborationManager(self)
         self.goals = GoalManager(self)
         self.learning = LearningEngine(self)
+        self.self_improve = SelfImprovementEngine(self)
         self.workers = WorkerManager(self)
         _cfg = get_config()
         setup_logging(_cfg.get("log_level", "INFO"), json_mode=bool(_cfg.get("log_json")))

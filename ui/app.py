@@ -64,7 +64,7 @@ def print_banner():
 ╔══════════════════════════════════════╗
 ║              P E A R                 ║
 ║     Personal Agent Runtime           ║
-║              v2.35                   ║
+║              v3.10                   ║
 ╚══════════════════════════════════════╝
   Type a message, or:
     /file <path>   – upload & summarize PDF/DOCX
@@ -871,6 +871,126 @@ def main() -> None:
                 print(r.to_dict() if hasattr(r, "to_dict") else r)
             except Exception as e:
                 print("  n8n:", e)
+            continue
+
+
+        if user.lower() in ("/self-improve",):
+            print(orch.self_improve.run_cycle())
+            continue
+        if user.lower() in ("/improvement-report",):
+            print(orch.self_improve.report())
+            continue
+        if user.lower() in ("/improvement-history",):
+            for h in orch.self_improve.list_history(20):
+                print(" ", h)
+            continue
+        if user.lower().startswith("/rollback-improvement "):
+            pid = user.split(maxsplit=1)[1].strip()
+            print(orch.self_improve.rollback(pid).to_dict())
+            continue
+        if user.lower().startswith("/approve-improvement "):
+            pid = user.split(maxsplit=1)[1].strip()
+            p = orch.self_improve.approve(pid)
+            print(p.to_dict())
+            # does not auto-deploy — user must confirm separately via deploy if desired
+            continue
+
+
+        if user.lower() in ("/beta-keys",):
+            from core.beta import BetaManager
+            from core.config import get_config
+            bm = BetaManager(persist_dir=__import__("pathlib").Path(str(get_config().get("data_dir"))) / "beta")
+            print(bm.stats())
+            for k in bm.list_keys()[:30]:
+                print(f"  {k['code']}  {k['status']}  {k.get('bound_account') or ''}")
+            continue
+        if user.lower().startswith("/beta-create "):
+            from core.beta import BetaManager
+            from core.config import get_config
+            n = int(user.split(maxsplit=1)[1])
+            bm = BetaManager(persist_dir=__import__("pathlib").Path(str(get_config().get("data_dir"))) / "beta")
+            keys = bm.create_keys(n, label_prefix="cli-")
+            for k in keys:
+                print(k.code)
+            continue
+        if user.lower().startswith("/beta-revoke "):
+            from core.beta import BetaManager
+            from core.config import get_config
+            kid = user.split(maxsplit=1)[1].strip()
+            bm = BetaManager(persist_dir=__import__("pathlib").Path(str(get_config().get("data_dir"))) / "beta")
+            print(bm.revoke(kid).to_dict())
+            continue
+
+
+        if user.lower() in ("/quant-shadow", "/shadow-status"):
+            print("  Shadow engine: use quant.ShadowEngine in code/API.")
+            print("  Hard constraint: no real orders, no broker trading credentials.")
+            print("  Commands: /shadow-status /shadow-report <id>")
+            continue
+        if user.lower().startswith("/shadow-report "):
+            print("  Load trial via ShadowEngine.report(id) in Python.")
+            continue
+
+
+        if user.lower() in ("/quant", "/quant-status"):
+            try:
+                from core.connectors import build_default_connectors
+                reg = build_default_connectors()
+                r = reg.execute("quant", "quant_dashboard")
+                if r.ok and isinstance(r.data, dict) and r.data.get("text"):
+                    print(r.data["text"])
+                else:
+                    print(" ", r.to_dict() if hasattr(r, "to_dict") else r)
+            except Exception as e:
+                print("  quant error:", e)
+            continue
+        if user.lower().startswith("/quant-candidate "):
+            try:
+                eid = user.split(None, 1)[1].strip()
+                from core.connectors import build_default_connectors
+                reg = build_default_connectors()
+                r = reg.execute("quant", "quant_candidate", experiment_id=eid)
+                print((r.data or {}).get("text") or r.to_dict())
+            except Exception as e:
+                print("  quant error:", e)
+            continue
+        if user.lower().startswith("/quant-hypothesis "):
+            try:
+                hid = user.split(None, 1)[1].strip()
+                from core.connectors import build_default_connectors
+                reg = build_default_connectors()
+                r = reg.execute("quant", "quant_lineage", hypothesis_id=hid)
+                print((r.data or {}).get("text") or r.to_dict())
+            except Exception as e:
+                print("  quant error:", e)
+            continue
+        if user.lower() == "/quant-candidates":
+            try:
+                from core.connectors import build_default_connectors
+                reg = build_default_connectors()
+                reg.execute("quant", "quant_status")  # ensure connect
+                r = reg.execute("quant", "quant_candidates")
+                print(" ", r.to_dict() if hasattr(r, "to_dict") else r)
+            except Exception as e:
+                print("  quant error:", e)
+            continue
+        if user.lower() == "/quant-hypotheses":
+            try:
+                from core.connectors import build_default_connectors
+                reg = build_default_connectors()
+                r = reg.execute("quant", "quant_hypotheses")
+                print(" ", r.to_dict() if hasattr(r, "to_dict") else r)
+            except Exception as e:
+                print("  quant error:", e)
+            continue
+        if user.lower() == "/quant-review":
+            try:
+                from core.connectors import build_default_connectors
+                reg = build_default_connectors()
+                r = reg.execute("quant", "quant_review")
+                print(" ", r.to_dict() if hasattr(r, "to_dict") else r)
+            except Exception as e:
+                print("  quant error:", e)
             continue
 
         if user.lower() == "/tasks":

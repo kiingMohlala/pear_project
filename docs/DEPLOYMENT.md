@@ -20,7 +20,7 @@ Environment:
 
 - [ ] `PEAR_PROFILE=production`
 - [ ] Change default `admin`/`demo` passwords
-- [ ] Restrict CORS (`cors_origins`)
+- [ ] Restrict CORS (`cors_origins`) — details in [CORS.md](CORS.md)
 - [ ] Mount durable volume on `/data`
 - [ ] Enable backups (`scripts/admin_cli.py backup`)
 - [ ] Configure reverse proxy TLS

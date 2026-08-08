@@ -32,3 +32,13 @@ orch_content.txt
 *.pyc
 __pycache__/
 .pytest_cache/
+
+# PEAR Mobile beta program (distributed separately)
+core/beta.py
+docs/BETA_PROGRAM.md
+samples/beta/
+scripts/seed_beta_keys.py
+tests/test_beta.py
+service/static/beta_activate.html
+service/static/beta_admin.html
+service/static/beta_feedback.html

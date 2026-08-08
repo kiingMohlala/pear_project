@@ -255,6 +255,90 @@
 - Tutorials + sample workflows
 - Opt-in planner learned bias (`planner_use_learned_bias`)
 - Strict v3.0 API compatibility
+- Thin client stub: clients/python/pear_client
+- Cookbook draft: docs/COOKBOOK.md
+- Updated progress in docs/ROADMAP_v3.1.md
+
+## v3.10 — Controlled Recursive Self-Improvement
+- SelfImprovementEngine: analyze → propose → validate → scorecard
+- Sandbox parameter tweaks only (no code mutation)
+- Full suite gate + auto-reject on regression thresholds
+- Human approval required before deploy (default)
+- Persistent history + rollback
+- CLI: /self-improve /improvement-report /improvement-history /rollback-improvement
+- Spans: self_improve.analyze/propose/validate/compare/rollback
+
+## Security Hardening (v3.1)
+- Session TTL/idle/revocation, login lockout
+- IDOR guards, input/upload limits, credential rotation
+- Security regression tests
+
+## Beta Testing System (current) — PEAR Mobile closed beta
+- Invitation keys with 30-day TTL, revoke, extend
+- Single device/account binding
+- Activation + feedback UI (`/beta`, `/beta/feedback`)
+- Consent-gated diagnostics/telemetry
+- Admin dashboard `/admin/beta`
+- Seed pack: `python scripts/seed_beta_keys.py --count 20`
+
+## AI Quant Research Lab (concept)
+- Strategy DSL, parallel backtest, evolution, walk-forward/MC robustness
+- Multi-objective rank + regime KB + explainability (no price prediction)
+- Package: quant/ — docs/QUANT_LAB.md
+
+## Quant v0.10 — Operator UX
+- Dashboard, candidate/hypothesis views, decision explanations, lineage
+- docs/QUANT_V010_UX.md
+
+## Quant v0.9 — PEAR Quant Connector
+- Research-only connector via ConnectorRegistry
+- Forbidden: real orders, capital, trading credentials
+- CLI /quant* · docs/QUANT_CONNECTOR_V09.md
+
+## Quant Lab v0.8 — Independent Review & Ranking
+- Disjoint independent validation (anti-leakage)
+- Multi-dimensional scorecards + sample-aware confidence
+- Hypothesis comparison by robustness, not return
+- Research decisions + queryable lineage
+- docs/QUANT_V08_REVIEW.md
+
+## Quant Lab v0.7 — Evidence-Driven Hypotheses
+- Immutable Hypothesis + falsification criteria
+- Evidence-gated generation; ungrounded ideas rejected
+- Spawn candidates into full research pipeline only
+- Lineage: experiment → hypothesis → candidate → experiment
+- docs/QUANT_V07_HYPOTHESIS.md
+
+## Quant Lab v0.6 — Multi-Market Shadow Matrix
+- Candidate × market × timeframe shadow trials
+- Regime/liquidity analysis + robustness ranking (not raw return)
+- Comparative reports with sample-size gates
+- docs/QUANT_V06_MATRIX.md
+
+## Quant Lab v0.5 — Live Shadow-Market Validation
+- ShadowEngine: live feed, frozen candidates, zero orders
+- kind=shadow ledger, server_ts, no broker API
+- docs/QUANT_V05_SHADOW.md
+
+## Quant Lab v0.4 — Research Intelligence & Experiment Memory
+- Immutable sealed experiments + content hash
+- Research memory: similar experiments, failure patterns, family/market summaries
+- Analysis: OOS degradation, paper divergence, parameter stability
+- Human research reports (no profitability claims)
+- docs/QUANT_V04_RESEARCH.md
+
+## Quant Lab v0.3 — Long-Horizon Paper Validation
+- Frozen strategy trials, 30/60/90 checkpoints
+- Execution costs + delay; backtest vs paper divergence (primary gate)
+- Auto-retire on DD / consecutive losses / HIGH divergence
+- Market data store + gap detection; restart recovery
+- docs/QUANT_V03_VALIDATION.md
+
+## Quant Lab v0.2 — Paper Trading Validation
+- PaperTradingEngine + demo broker adapters (sim/OANDA practice/IB paper/MT demo)
+- SQLite trade/signal store, rolling metrics, regime PnL
+- Promotion ladder with auto demote/retire
+- docs/QUANT_PAPER_v02.md
 
 ## v0.5
 - Desktop Vision (screen understanding)
