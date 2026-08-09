@@ -1,0 +1,13 @@
+{
+  "name": "weather",
+  "version": "0.1.0",
+  "author": "PEAR",
+  "description": "Demo weather lookup tool + /weather command",
+  "entry": "plugin.py",
+  "capabilities": ["weather"],
+  "permissions": ["register_tool", "register_command"],
+  "pear_version": ">=1.0",
+  "dependencies": [],
+  "checksum": "",
+  "enabled_by_default": true
+}

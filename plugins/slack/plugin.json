@@ -1,0 +1,13 @@
+{
+  "name": "slack",
+  "version": "0.1.0",
+  "author": "PEAR",
+  "description": "Slack post stub (dry-run) + /slack command",
+  "entry": "plugin.py",
+  "capabilities": ["slack"],
+  "permissions": ["register_tool", "register_command"],
+  "pear_version": ">=1.0",
+  "dependencies": [],
+  "checksum": "",
+  "enabled_by_default": true
+}

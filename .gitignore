@@ -7,8 +7,11 @@ __pycache__/
 .venv/
 venv/
 data/
-*.json
-!package.json
+# runtime-generated JSON only — a blanket *.json rule here previously
+# silently dropped plugins/*/plugin.json (source, should be tracked) along
+# with the genuinely local files below. Keep this list specific.
+plugins/**/.state.json
+/users.json
 .DS_Store
 .idea/
 .vscode/
