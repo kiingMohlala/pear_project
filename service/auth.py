@@ -223,6 +223,10 @@ class AuthManager:
         self._save_sessions()
         return user
 
+    def authenticate(self, username: str, password: str) -> Optional[User]:
+        """Alias for login() — some callers/tests expect this name."""
+        return self.login(username, password)
+
     def login_status(self, username: str) -> Dict[str, Any]:
         user = self.users.get(username)
         if not user:

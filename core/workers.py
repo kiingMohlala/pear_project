@@ -410,6 +410,27 @@ class WorkerManager:
         worker: WorkerInfo,
         execute_fn: Optional[Callable],
     ) -> DispatchRecord:
+        # PEAR 3.1 Gate 1: this runs inside a ThreadPoolExecutor worker
+        # thread, which does NOT inherit the submitting thread's contextvars
+        # (and pool threads are reused across dispatches from different
+        # requests) — so the tracer must be activated here, not in dispatch().
+        _tracer_token = None
+        if self.orch is not None:
+            from .tracing import set_tracer
+            _tracer_token = set_tracer(self.orch.tracer)
+        try:
+            return self._run_local_inner(rec, worker, execute_fn)
+        finally:
+            if _tracer_token is not None:
+                from .tracing import reset_tracer
+                reset_tracer(_tracer_token)
+
+    def _run_local_inner(
+        self,
+        rec: DispatchRecord,
+        worker: WorkerInfo,
+        execute_fn: Optional[Callable],
+    ) -> DispatchRecord:
         rec.status = DispatchStatus.RUNNING
         t0 = time.time()
         try:
@@ -463,6 +484,23 @@ class WorkerManager:
         return rec
 
     def _run_remote(
+        self,
+        rec: DispatchRecord,
+        worker: WorkerInfo,
+        execute_fn: Optional[Callable],
+    ) -> DispatchRecord:
+        _tracer_token = None
+        if self.orch is not None:
+            from .tracing import set_tracer
+            _tracer_token = set_tracer(self.orch.tracer)
+        try:
+            return self._run_remote_inner(rec, worker, execute_fn)
+        finally:
+            if _tracer_token is not None:
+                from .tracing import reset_tracer
+                reset_tracer(_tracer_token)
+
+    def _run_remote_inner(
         self,
         rec: DispatchRecord,
         worker: WorkerInfo,

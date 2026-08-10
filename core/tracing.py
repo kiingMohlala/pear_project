@@ -417,17 +417,53 @@ class Tracer:
             pass
 
 
-# Global default tracer (orchestrator may replace with persisted instance)
-_default_tracer: Optional[Tracer] = None
+# ── Tracer scoping (PEAR 3.1 Gate 1) ────────────────────────────────
+#
+# Previously _default_tracer was a bare module global: every Orchestrator
+# (one per authenticated user) called set_tracer(self.tracer) in __init__,
+# silently repointing the ONE global at whichever user's session was built
+# most recently — every other in-flight user's spans, and GET /v1/traces,
+# would then read/write the wrong user's tracer.
+#
+# Fix: a contextvars.ContextVar instead of a bare global. Python gives each
+# new native thread (ThreadingHTTPServer's per-request thread, JobManager's
+# worker thread, WorkerManager's ThreadPoolExecutor thread) its own empty
+# Context by default, and asyncio propagates context per-task — so setting
+# the tracer once at each request/thread entry point keeps it correctly
+# scoped without touching any of the 28 call sites that just do
+# get_tracer().span(...).
+import contextvars
+
+_tracer_ctx: "contextvars.ContextVar[Optional[Tracer]]" = contextvars.ContextVar(
+    "pear_current_tracer", default=None
+)
+# Fallback only for contexts with no active per-user tracer (bare scripts, tests).
+_fallback_tracer: Optional[Tracer] = None
 
 
 def get_tracer() -> Tracer:
-    global _default_tracer
-    if _default_tracer is None:
-        _default_tracer = Tracer()
-    return _default_tracer
+    t = _tracer_ctx.get()
+    if t is not None:
+        return t
+    global _fallback_tracer
+    if _fallback_tracer is None:
+        _fallback_tracer = Tracer()
+    return _fallback_tracer
 
 
-def set_tracer(tracer: Tracer) -> None:
-    global _default_tracer
-    _default_tracer = tracer
+def set_tracer(tracer: Tracer) -> "contextvars.Token":
+    """
+    Activate `tracer` as the current context's (thread's / async task's)
+    tracer. Returns a Token — pass it to reset_tracer() when the request/
+    job/dispatch this was activated for is finished, so a reused thread
+    (e.g. a ThreadPoolExecutor worker) can't leak one user's tracer into
+    the next unrelated task run on the same OS thread.
+    """
+    return _tracer_ctx.set(tracer)
+
+
+def reset_tracer(token: "contextvars.Token") -> None:
+    try:
+        _tracer_ctx.reset(token)
+    except Exception:
+        pass

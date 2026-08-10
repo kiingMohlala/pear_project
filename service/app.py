@@ -222,6 +222,13 @@ class PearService:
         self.auth.require(user, Role.USER, Role.ADMIN, Role.API_CLIENT)
         sess = self.sessions.get(user.username)
         orch = sess.orchestrator
+        # PEAR 3.1 Gate 1: activate this user's tracer for the rest of this
+        # request. No explicit reset needed here — ThreadingHTTPServer gives
+        # each request its own brand-new thread that terminates right after
+        # (never pooled/reused), unlike the ThreadPoolExecutor paths in
+        # JobManager/WorkerManager where an explicit reset is required.
+        from core.tracing import set_tracer as _set_tracer
+        _set_tracer(orch.tracer)
 
 
         if path == "/v1/upload" and method == "POST":
@@ -329,9 +336,7 @@ class PearService:
 
         if path == "/v1/traces" and method == "GET":
             try:
-                from core.tracing import get_tracer
-                tr = get_tracer()
-                traces = list(getattr(tr, "_traces", {}).keys())[-50:]
+                traces = orch.tracer.list_traces(limit=50)
             except Exception:
                 traces = []
             return 200, {"ok": True, "traces": traces}

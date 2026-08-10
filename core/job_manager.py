@@ -31,12 +31,14 @@ class JobManager:
         runner: Optional[JobRunner] = None,
         poll_interval: float = 0.25,
         max_workers: int = 1,
+        tracer: Optional[Any] = None,
     ):
         self.events = events or EventBus()
         self.persist_path = Path(persist_path) if persist_path else None
         self.runner = runner
         self.poll_interval = poll_interval
         self.max_workers = max(1, max_workers)
+        self.tracer = tracer  # PEAR 3.1 Gate 1: owning orchestrator's tracer, if any
 
         self._jobs: Dict[str, Job] = {}
         self._lock = threading.RLock()
@@ -407,6 +409,18 @@ class JobManager:
             {"job_id": job.id, "objective": job.objective, "attempt": job.attempts},
             source="job_manager",
         )
+        _tracer_token = None
+        if self.tracer is not None:
+            from .tracing import set_tracer
+            _tracer_token = set_tracer(self.tracer)
+        try:
+            self._execute_inner(job)
+        finally:
+            if _tracer_token is not None:
+                from .tracing import reset_tracer
+                reset_tracer(_tracer_token)
+
+    def _execute_inner(self, job: Job) -> None:
         try:
             if self.runner is None:
                 raise RuntimeError("No job runner configured")

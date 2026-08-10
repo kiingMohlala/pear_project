@@ -24,7 +24,7 @@ from .task_graph import TaskGraph
 from .executor import Executor, ResultAggregator
 from .job import Job, JobStatus, JobPriority
 from .job_manager import JobManager
-from .tracing import Tracer, get_tracer, set_tracer
+from .tracing import Tracer, get_tracer, set_tracer, reset_tracer
 from .workflow import WorkflowRunner, Workflow, WorkflowStep
 from .connectors import build_default_connectors, ConnectorRegistry
 from .media import MediaManager
@@ -73,6 +73,23 @@ class Orchestrator:
             aggregator=ResultAggregator(),
         )
 
+        # Tracer must exist before JobManager so it can be threaded into
+        # background job execution (PEAR 3.1 Gate 1).
+        trace_path = None
+        if getattr(self.memory, "persist_dir", None):
+            from pathlib import Path as _P
+            trace_path = _P(self.memory.persist_dir) / "traces.sqlite"
+        self.tracer = Tracer(persist_path=trace_path)
+        # NOTE (PEAR 3.1 Gate 1): no longer calls the module-level set_tracer()
+        # here. Doing that at construction time was the root cause of the
+        # cross-user leak — every new user's first request would silently
+        # repoint the ONE global tracer at their own instance. The tracer is
+        # now activated per-request/per-thread at actual entry points
+        # (route(), run(), JobManager._execute(), WorkerManager dispatch)
+        # via core.tracing.set_tracer()'s contextvar, which is naturally
+        # scoped to the current thread/async task and never leaks across
+        # concurrent users. See core/tracing.py for the mechanism.
+
         # Background jobs (v0.33) – optional persist_dir via memory
         persist = None
         if getattr(self.memory, "persist_dir", None):
@@ -83,14 +100,8 @@ class Orchestrator:
             persist_path=persist,
             runner=self._run_job,
             max_workers=1,
+            tracer=self.tracer,
         )
-
-        trace_path = None
-        if getattr(self.memory, "persist_dir", None):
-            from pathlib import Path as _P
-            trace_path = _P(self.memory.persist_dir) / "traces.sqlite"
-        self.tracer = Tracer(persist_path=trace_path)
-        set_tracer(self.tracer)
 
         wf_dir = None
         if getattr(self.memory, "persist_dir", None):
@@ -296,6 +307,27 @@ class Orchestrator:
         if not user_input:
             return {"ok": False, "error": "Empty input"}
 
+        # Gate 1: activate THIS orchestrator's tracer for the current
+        # thread/async task, so every get_tracer() call reached indirectly
+        # through agents/connectors/workers during this request resolves to
+        # the correct per-user tracer, not whatever the global happened to
+        # be. Always reset — this thread may be reused (e.g. a pooled
+        # worker) and must not carry this user's tracer into unrelated work.
+        _tracer_token = set_tracer(self.tracer)
+        try:
+            return self._route_inner(user_input, preferred, required_capabilities, parent_task, on_token, **kwargs)
+        finally:
+            reset_tracer(_tracer_token)
+
+    def _route_inner(
+        self,
+        user_input: str,
+        preferred: Optional[str] = None,
+        required_capabilities: Optional[List[str]] = None,
+        parent_task: Optional[Task] = None,
+        on_token=None,
+        **kwargs,
+    ) -> Dict[str, Any]:
         trace = self.tracer.start_trace(
             "request",
             kind="request",
