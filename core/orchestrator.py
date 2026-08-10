@@ -50,7 +50,16 @@ class Orchestrator:
         registry: Optional[ToolRegistry] = None,
         events: Optional[EventBus] = None,
         llm: Optional[BaseLLM] = None,
+        user_id: Optional[str] = None,
     ):
+        # PEAR 3.1 Gate 4: the authenticated identity this orchestrator
+        # belongs to, if any (SessionManager passes this in — one
+        # Orchestrator per user). Durable records this orchestrator creates
+        # (jobs, goals, workflow runs, worker dispatches) stamp themselves
+        # with this automatically, so ownership is explicit and checkable
+        # rather than only inferred from "which Orchestrator instance holds
+        # this object in memory right now."
+        self.user_id = user_id
         self.memory = memory or Memory()
         self.registry = registry or build_default_registry()
         self.events = events or EventBus()
@@ -101,6 +110,7 @@ class Orchestrator:
             runner=self._run_job,
             max_workers=1,
             tracer=self.tracer,
+            owner_user_id=self.user_id,
         )
 
         wf_dir = None

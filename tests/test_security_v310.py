@@ -147,9 +147,108 @@ def test_gate1_sequential_construction_does_not_swap_global():
         assert fallback is not tracer_b
 
 
+def _goal_create(port: int, token: str, objective: str) -> dict:
+    req = Request(
+        f"http://127.0.0.1:{port}/v1/goals",
+        data=json.dumps({"objective": objective}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    with urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+# ── Gate 4: explicit ownership propagation ───────────────────────────
+
+def test_gate4_goal_stamped_with_owner_over_http():
+    with tempfile.TemporaryDirectory() as td:
+        service, httpd, port = _start_server(Path(td))
+        try:
+            token_demo = _login(port, "demo", "demo")
+            token_admin = _login(port, "admin", "admin")
+
+            g_demo = _goal_create(port, token_demo, "demo's private goal")
+            g_admin = _goal_create(port, token_admin, "admin's private goal")
+
+            assert g_demo["goal"]["user_id"] == "demo"
+            assert g_admin["goal"]["user_id"] == "admin"
+            assert g_demo["goal"]["user_id"] != g_admin["goal"]["user_id"]
+        finally:
+            httpd.shutdown()
+
+
+def test_gate4_job_goal_workflow_dispatch_stamped_with_owner():
+    """Direct-orchestrator check for the record types with no dedicated
+    HTTP creation route (jobs, workflow runs, worker dispatches)."""
+    from service.sessions import SessionManager
+
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice = sm.get("alice").orchestrator
+        bob = sm.get("bob").orchestrator
+
+        assert alice.user_id == "alice"
+        assert bob.user_id == "bob"
+
+        job_a = alice.jobs.enqueue("alice job")
+        job_b = bob.jobs.enqueue("bob job")
+        assert job_a.user_id == "alice"
+        assert job_b.user_id == "bob"
+
+        goal_a = alice.goals.create("alice goal", auto_start=False)
+        goal_b = bob.goals.create("bob goal", auto_start=False)
+        assert goal_a.user_id == "alice"
+        assert goal_b.user_id == "bob"
+
+        run_a = alice.workflows.start("daily_briefing") if "daily_briefing" in alice.workflows.definitions else None
+        if run_a is not None:
+            assert run_a.user_id == "alice"
+
+        rec_a = alice.workers.dispatch("alice dispatch", execute_fn=lambda obj: {"ok": True})
+        rec_b = bob.workers.dispatch("bob dispatch", execute_fn=lambda obj: {"ok": True})
+        assert rec_a.session_user == "alice"
+        assert rec_b.session_user == "bob"
+
+
+def test_gate4_ownership_survives_restart():
+    """Persist a job and a goal under one SessionManager, then build a
+    FRESH SessionManager pointed at the same data_root (simulating a
+    process restart) and confirm ownership is still correct after reload
+    from disk, not just held in memory."""
+    from service.sessions import SessionManager
+
+    with tempfile.TemporaryDirectory() as td:
+        data_root = Path(td)
+
+        sm1 = SessionManager(data_root=data_root, llm=EchoLLM())
+        orch1 = sm1.get("carol").orchestrator
+        job = orch1.jobs.enqueue("carol's job")
+        goal = orch1.goals.create("carol's goal", auto_start=False)
+        job_id, goal_id = job.id, goal.id
+
+        # Simulate restart: brand-new SessionManager/Orchestrator instances,
+        # same on-disk data_root — nothing carried over in memory.
+        sm2 = SessionManager(data_root=data_root, llm=EchoLLM())
+        orch2 = sm2.get("carol").orchestrator
+
+        reloaded_job = orch2.jobs.get_job(job_id) if hasattr(orch2.jobs, "get_job") else orch2.jobs._jobs.get(job_id)
+        assert reloaded_job is not None, "job did not survive restart at all"
+        assert reloaded_job.user_id == "carol", "job ownership lost across restart"
+
+        reloaded_goal = orch2.goals.get(goal_id)
+        assert reloaded_goal is not None, "goal did not survive restart at all"
+        assert reloaded_goal.user_id == "carol", "goal ownership lost across restart"
+
+
 if __name__ == "__main__":
     test_gate1_concurrent_traces_no_cross_user_leak()
     print("  ✓ gate1 concurrent traces — no cross-user leak")
     test_gate1_sequential_construction_does_not_swap_global()
     print("  ✓ gate1 construction does not swap global")
+    test_gate4_goal_stamped_with_owner_over_http()
+    print("  ✓ gate4 goal stamped with owner (HTTP)")
+    test_gate4_job_goal_workflow_dispatch_stamped_with_owner()
+    print("  ✓ gate4 job/goal/workflow/dispatch stamped with owner")
+    test_gate4_ownership_survives_restart()
+    print("  ✓ gate4 ownership survives restart")
     print("All PEAR 3.1 security tests passed (gates implemented so far).")

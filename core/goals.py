@@ -93,6 +93,7 @@ class Goal:
     id: str
     title: str
     objective: str
+    user_id: Optional[str] = None  # PEAR 3.1 Gate 4: owning authenticated identity
     status: GoalStatus = GoalStatus.PENDING
     priority: int = 5
     created_at: float = field(default_factory=time.time)
@@ -117,6 +118,7 @@ class Goal:
             "id": self.id,
             "title": self.title,
             "objective": self.objective,
+            "user_id": self.user_id,
             "status": self.status.value if isinstance(self.status, GoalStatus) else self.status,
             "priority": self.priority,
             "created_at": self.created_at,
@@ -143,6 +145,7 @@ class Goal:
             id=d["id"],
             title=d.get("title") or d.get("objective", "")[:60],
             objective=d["objective"],
+            user_id=d.get("user_id"),
             status=GoalStatus(d.get("status", "pending")),
             priority=int(d.get("priority") or 5),
             created_at=float(d.get("created_at") or time.time()),
@@ -244,6 +247,7 @@ class GoalManager:
             id=gid,
             title=(title or objective[:60]).strip(),
             objective=objective.strip(),
+            user_id=getattr(self.orch, "user_id", None),
             priority=priority,
             milestones=[
                 Milestone(id=f"ms_{i}", title=t)

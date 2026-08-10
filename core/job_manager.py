@@ -32,6 +32,7 @@ class JobManager:
         poll_interval: float = 0.25,
         max_workers: int = 1,
         tracer: Optional[Any] = None,
+        owner_user_id: Optional[str] = None,
     ):
         self.events = events or EventBus()
         self.persist_path = Path(persist_path) if persist_path else None
@@ -39,6 +40,7 @@ class JobManager:
         self.poll_interval = poll_interval
         self.max_workers = max(1, max_workers)
         self.tracer = tracer  # PEAR 3.1 Gate 1: owning orchestrator's tracer, if any
+        self.owner_user_id = owner_user_id  # PEAR 3.1 Gate 4: default owner for enqueued jobs
 
         self._jobs: Dict[str, Job] = {}
         self._lock = threading.RLock()
@@ -136,9 +138,11 @@ class JobManager:
         plan_snapshot: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         max_attempts: int = 3,
+        user_id: Optional[str] = None,
     ) -> Job:
         job = Job(
             objective=objective,
+            user_id=user_id if user_id is not None else self.owner_user_id,
             priority=priority,
             status=JobStatus.QUEUED,
             scheduled_at=scheduled_at,

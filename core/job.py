@@ -44,6 +44,7 @@ PRIORITY_ORDER = {
 class Job:
     objective: str
     id: str = field(default_factory=lambda: f"job_{uuid.uuid4().hex[:10]}")
+    user_id: Optional[str] = None  # PEAR 3.1 Gate 4: owning authenticated identity
     status: JobStatus = JobStatus.PENDING
     priority: JobPriority = JobPriority.NORMAL
     progress: float = 0.0  # 0.0 – 1.0

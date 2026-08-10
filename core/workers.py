@@ -359,13 +359,14 @@ class WorkerManager:
         execute_fn: Optional[Callable[[str], Any]] = None,
     ) -> DispatchRecord:
         caps = required_capabilities or infer_capabilities(objective)
+        owner = session_user if session_user is not None else getattr(self.orch, "user_id", None)
         rec = DispatchRecord(
             id=f"disp_{uuid.uuid4().hex[:10]}",
             objective=objective,
             required_capabilities=caps,
             timeout_s=timeout_s,
             max_attempts=max_attempts,
-            session_user=session_user,
+            session_user=owner,
         )
         with self._lock:
             self.dispatches[rec.id] = rec

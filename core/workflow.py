@@ -137,6 +137,7 @@ class Workflow:
 class WorkflowRun:
     workflow_name: str
     id: str = field(default_factory=lambda: f"wfr_{uuid.uuid4().hex[:10]}")
+    user_id: Optional[str] = None  # PEAR 3.1 Gate 4: owning authenticated identity
     status: WorkflowStatus = WorkflowStatus.PENDING
     context: Dict[str, Any] = field(default_factory=dict)
     steps: List[WorkflowStep] = field(default_factory=list)
@@ -155,6 +156,7 @@ class WorkflowRun:
         return {
             "id": self.id,
             "workflow_name": self.workflow_name,
+            "user_id": self.user_id,
             "status": self.status.value if isinstance(self.status, WorkflowStatus) else self.status,
             "context": self.context,
             "steps": [s.to_dict() for s in self.steps],
@@ -176,6 +178,7 @@ class WorkflowRun:
         return cls(
             id=data.get("id") or f"wfr_{uuid.uuid4().hex[:10]}",
             workflow_name=data.get("workflow_name") or "",
+            user_id=data.get("user_id"),
             status=status,
             context=dict(data.get("context") or {}),
             steps=steps,
@@ -388,6 +391,7 @@ class WorkflowRunner:
         run = WorkflowRun(
             id=run_id or f"wfr_{uuid.uuid4().hex[:10]}",
             workflow_name=name,
+            user_id=getattr(self.orch, "user_id", None),
             status=WorkflowStatus.RUNNING,
             context=dict(context or {}),
             steps=[deepcopy(s) for s in (

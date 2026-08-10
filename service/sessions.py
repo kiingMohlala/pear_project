@@ -48,7 +48,7 @@ class SessionManager:
         persist.mkdir(parents=True, exist_ok=True)
         llm = self.llm or create_llm()
         mem = Memory(session_id=user_id, persist_dir=persist)
-        orch = Orchestrator(memory=mem, llm=llm)
+        orch = Orchestrator(memory=mem, llm=llm, user_id=user_id)
         # register standard agents
         orch.register(PersonalAgent(llm=llm), default=True)
         for cls in (
