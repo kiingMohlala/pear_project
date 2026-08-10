@@ -1,9 +1,54 @@
 # PEAR Audit Log
 
-Running punch-list from the module-by-module pass. `docs/roadmap.md` says what
-was *intended*; this says what's actually been verified by running the code,
-not just reading it. Status is only set to Fixed once it's been executed and
-checked, not once code has been written.
+## PEAR 3.1 — Ownership, Isolation & Concurrency Hardening
+
+Status of the 9-gate task card. Each gate is only marked done once it has
+a real test that (a) fails against the pre-fix code via `git stash` and
+(b) passes against the fix, run stable across repeated full-suite runs —
+not just "code written."
+
+- 🟢 **Gate 1 — Tracer isolation.** Fixed in `b93c91c`. Root cause was
+  deeper than the original audit's `/v1/traces` finding: 28 call sites
+  across agents/connectors/workers/goals all read a bare process-global,
+  and `Orchestrator.__init__` mutated it on every construction. Replaced
+  with a `contextvars.ContextVar` (zero changes needed to those 28 sites),
+  activated at `route()`, `JobManager._execute()`, and
+  `WorkerManager._run_local/_run_remote`. Verified with a real
+  `ThreadingHTTPServer`, two real users, 50 concurrent `/v1/chat` requests.
+- 🟡 Gate 2 — Resource ownership / IDOR protection. Not started. Depends
+  on Gate 4 (below) for something to check ownership against.
+- 🟡 Gate 3 — Credential isolation. Not started.
+- 🟢 **Gate 4 — Explicit ownership propagation.** Fixed in `f108bf5`.
+  `Orchestrator` now carries `self.user_id`, set once at construction by
+  `SessionManager`. `Job`, `Goal`, and `WorkflowRun` all gained a `user_id`
+  field, auto-stamped from the owning orchestrator. `DispatchRecord`'s
+  existing-but-unused `session_user` field now actually gets populated.
+  Deliberately skipped "Connector execution" — no durable record exists
+  for it at all (nothing to stamp, adding one would be a feature, not a
+  fix). Found but not fixed: `WorkerManager` computes a `persist_dir` but
+  has zero save/load calls anywhere — dispatches don't survive restart at
+  all, independent of ownership. Flagged below for Gate 7.
+- 🟡 Gate 5 — Worker identity propagation. Not started. `_run_remote()`
+  still drops `session_user` before it reaches the remote endpoint
+  (confirmed in the architecture audit, not yet fixed).
+- 🟡 Gate 6 — Session lifecycle (eviction). Not started.
+- 🟡 Gate 7 — Persistence/recovery audit. Not started as its own pass, but
+  now has two concrete items queued: WorkerManager's missing persistence
+  (above), and the broad `except: pass` patterns on auth/session file loads
+  noted in the original architecture audit.
+- 🟡 Gate 8 — Concurrency testing (30 concurrent users). Not started —
+  intentionally sequenced last among the gates it depends on.
+- 🟡 Gate 9 — API surface reconciliation (stdlib vs FastAPI). Not started.
+
+See `tests/test_security_v310.py` for the live test suite as gates land.
+
+---
+
+## Pre-3.1 findings (module-by-module pass, before the v3.0/quant merge)
+
+`docs/roadmap.md` says what was *intended*; this says what's actually been
+verified by running the code, not just reading it. Status is only set to
+Fixed once it's been executed and checked, not once code has been written.
 
 Legend: 🔴 Broken · 🟡 Open / not yet diagnosed · 🟢 Fixed & verified
 
