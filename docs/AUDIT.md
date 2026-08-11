@@ -15,8 +15,29 @@ not just "code written."
   activated at `route()`, `JobManager._execute()`, and
   `WorkerManager._run_local/_run_remote`. Verified with a real
   `ThreadingHTTPServer`, two real users, 50 concurrent `/v1/chat` requests.
-- 🟡 Gate 2 — Resource ownership / IDOR protection. Not started. Depends
-  on Gate 4 (below) for something to check ownership against.
+- 🟢 **Gate 2 — Resource ownership / IDOR protection.** Fixed in `e1ab238`.
+  Audited every ID-accepting route: `/v1/goals/<gid>` is the *only* by-ID
+  resource route that exists anywhere in the stdlib dispatcher — jobs,
+  workflows, memories, traces, plugins, connectors have no individual
+  lookup route at all today, so most of the task card's example resource
+  types have no reachable IDOR surface yet (noted, not invented). Found a
+  real bug unrelated to numeric/path IDs but the same class: `/v1/beta/activate`
+  and `/v1/beta/status` both let an authenticated caller's request body
+  override their own identity (`account = data.get("account") or
+  user.username`, wrong priority), and `/v1/beta/status` required no
+  credential at all — a pure account-status oracle. Fixed both; server-
+  derived identity always wins now. Added an explicit `authorize_resource()`
+  check on `/v1/goals/<gid>` using `Goal.user_id` (Gate 4) as defense-in-
+  depth, even though the route is already structurally safe via per-user
+  Orchestrator scoping — denial returns 404, not 403, so it can't be used
+  to enumerate other users' IDs.
+  **New tracked gap:** admin's `authorize_resource(allow_admin=True)`
+  bypass is correct at the check level but currently unreachable via any
+  HTTP route — admin is scoped to admin's own Orchestrator same as anyone
+  else, so admin gets 404 on another user's goal too. Confirmed this
+  predates Gate 2 (tested directly against `SessionManager`). Needs an
+  actual cross-session resource-lookup path for admins — a real design
+  decision, not queued to a specific gate yet.
 - 🟡 Gate 3 — Credential isolation. Not started.
 - 🟢 **Gate 4 — Explicit ownership propagation.** Fixed in `f108bf5`.
   `Orchestrator` now carries `self.user_id`, set once at construction by
