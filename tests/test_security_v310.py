@@ -442,6 +442,159 @@ def test_gate2_beta_status_cannot_probe_other_accounts():
             httpd.shutdown()
 
 
+# ── Gate 5: worker identity propagation ───────────────────────────────
+
+def _start_fake_remote_worker(response_body: dict):
+    """A minimal HTTP server standing in for a remote PEAR /v1/chat
+    endpoint, so _run_remote is exercised against a real socket, not
+    mocked out. Captures the last request it received."""
+    import http.server
+
+    captured = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode())
+            captured["body"] = body
+            captured["auth_header"] = self.headers.get("Authorization")
+            resp = json.dumps(response_body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    time.sleep(0.1)
+    return httpd, port, captured
+
+
+def test_gate5_origin_identity_sent_as_metadata_not_credential():
+    """The outbound dispatch to a remote worker carries the originating
+    user_id as plain informational metadata (for the remote side's own
+    audit trail), separately from the actual auth credential (the worker's
+    bearer token)."""
+    from core.orchestrator import Orchestrator
+    from core.workers import WorkerManager
+
+    httpd, port, captured = _start_fake_remote_worker({"ok": True, "reply": "hi"})
+    try:
+        orch = Orchestrator(user_id="alice")
+        wm = WorkerManager(orch)
+        w = wm.register_worker("remote1", endpoint=f"http://127.0.0.1:{port}", capabilities={"browser"})
+        w.meta["token"] = "worker-secret-token"
+
+        rec = wm.dispatch("alice's objective", required_capabilities=["browser"])
+        wm.wait(rec.id, timeout=5)
+
+        assert captured.get("body", {}).get("origin_user_id") == "alice"
+        assert captured.get("body", {}).get("message") == "alice's objective"
+        # the actual credential is the bearer token, never the identity field
+        assert captured.get("auth_header") == "Bearer worker-secret-token"
+    finally:
+        httpd.shutdown()
+
+
+def test_gate5_spoofed_identity_in_remote_response_cannot_override_ownership():
+    """A malicious/compromised remote worker returns a response body that
+    tries to claim a different user_id/account. Local ownership
+    (rec.session_user, set at dispatch time from the authenticated caller)
+    must not change."""
+    from core.orchestrator import Orchestrator
+    from core.workers import WorkerManager
+
+    httpd, port, captured = _start_fake_remote_worker({
+        "ok": True,
+        "reply": "pwned",
+        "user_id": "attacker",
+        "account": "attacker",
+        "owner": "attacker",
+    })
+    try:
+        orch = Orchestrator(user_id="alice")
+        wm = WorkerManager(orch)
+        w = wm.register_worker("remote2", endpoint=f"http://127.0.0.1:{port}", capabilities={"browser"})
+        w.meta["token"] = "worker-secret-token"
+
+        rec = wm.dispatch("alice's objective", required_capabilities=["browser"])
+        wm.wait(rec.id, timeout=5)
+
+        assert rec.session_user == "alice", "remote response was able to override local ownership"
+        assert rec.result.get("reply") == "pwned"  # content is still taken from the response
+    finally:
+        httpd.shutdown()
+
+
+def test_gate5_retry_preserves_ownership_local_and_remote():
+    from core.orchestrator import Orchestrator
+    from core.workers import WorkerManager
+
+    # local path: execute_fn fails once, then succeeds
+    calls = {"n": 0}
+
+    def flaky(objective):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise RuntimeError("transient")
+        return {"ok": True, "reply": "done"}
+
+    orch = Orchestrator(user_id="bob")
+    wm = WorkerManager(orch)
+    wm.register_worker("local1")
+    rec = wm.dispatch("bob's job", execute_fn=flaky, max_attempts=3)
+    wm.wait(rec.id, timeout=5)
+    assert rec.status.value == "succeeded"
+    assert rec.attempts >= 2
+    assert rec.session_user == "bob", "ownership lost across a local retry"
+
+    # remote path: first response is a 500 (triggers retry), second succeeds
+    import http.server
+    hits = {"n": 0}
+
+    class FlakyHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            hits["n"] += 1
+            if hits["n"] < 2:
+                self.send_response(500)
+                self.end_headers()
+                return
+            resp = json.dumps({"ok": True, "reply": "done"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), FlakyHandler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    time.sleep(0.1)
+    try:
+        orch2 = Orchestrator(user_id="carol")
+        wm2 = WorkerManager(orch2)
+        w = wm2.register_worker("remote3", endpoint=f"http://127.0.0.1:{port}")
+        w.meta["token"] = "tok"
+        rec2 = wm2.dispatch("carol's job", max_attempts=3)
+        wm2.wait(rec2.id, timeout=10)
+        assert rec2.session_user == "carol", "ownership lost across a remote retry"
+        assert rec2.status.value == "succeeded"
+    finally:
+        httpd.shutdown()
+
+
 if __name__ == "__main__":
     test_gate1_concurrent_traces_no_cross_user_leak()
     print("  ✓ gate1 concurrent traces — no cross-user leak")
@@ -463,4 +616,10 @@ if __name__ == "__main__":
     print("  ✓ gate2 beta activate ignores client-supplied account override")
     test_gate2_beta_status_cannot_probe_other_accounts()
     print("  ✓ gate2 beta status cannot probe other accounts")
+    test_gate5_origin_identity_sent_as_metadata_not_credential()
+    print("  ✓ gate5 origin identity sent as metadata, not credential")
+    test_gate5_spoofed_identity_in_remote_response_cannot_override_ownership()
+    print("  ✓ gate5 spoofed remote response cannot override ownership")
+    test_gate5_retry_preserves_ownership_local_and_remote()
+    print("  ✓ gate5 retry preserves ownership (local + remote)")
     print("All PEAR 3.1 security tests passed (gates implemented so far).")

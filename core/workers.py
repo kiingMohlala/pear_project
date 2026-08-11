@@ -512,7 +512,20 @@ class WorkerManager:
         t0 = time.time()
         try:
             import urllib.request
-            payload = json.dumps({"message": rec.objective}).encode("utf-8")
+            # PEAR 3.1 Gate 5: origin_user_id/dispatch_id are sent as
+            # INFORMATIONAL metadata only, for the remote side's own audit
+            # trail/tracing correlation — they are never treated as an
+            # authentication credential. The worker's bearer token (below)
+            # is the only thing that actually authenticates this request;
+            # whoever that token belongs to on the remote side is who the
+            # remote PEAR instance will authorize the request as. Sending
+            # rec.session_user does not and must not grant it any
+            # authority there.
+            payload = json.dumps({
+                "message": rec.objective,
+                "dispatch_id": rec.id,
+                "origin_user_id": rec.session_user,
+            }).encode("utf-8")
             headers = {"Content-Type": "application/json"}
             token = worker.meta.get("token")
             if token:
@@ -525,6 +538,13 @@ class WorkerManager:
             )
             with urllib.request.urlopen(req, timeout=rec.timeout_s) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
+            # PEAR 3.1 Gate 5: rec.session_user was set locally, at dispatch
+            # time, from the authenticated caller (Gate 4) — nothing from
+            # the remote response is ever read into it here, deliberately.
+            # A compromised or malicious remote worker returning a body
+            # that happens to contain a "user_id"/"account"/similar key
+            # cannot reassign local ownership of this dispatch; only the
+            # objective's result content is taken from the response.
             rec.result = body
             rec.status = DispatchStatus.SUCCEEDED
             rec.finished_at = time.time()
