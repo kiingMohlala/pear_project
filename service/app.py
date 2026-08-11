@@ -182,12 +182,21 @@ class PearService:
             self.auth.require(user, Role.USER, Role.ADMIN, Role.API_CLIENT)
             return 200, {"ok": True, "user": user.to_public()}
 
-        # public beta activation (no auth — key is the credential)
+        # Beta activation is intentionally reachable without a PEAR login —
+        # the invite code itself is the credential for a first-launch mobile
+        # flow (see BetaKey.activate: rebinding an already-claimed code to a
+        # different account/device is already rejected there).
+        # PEAR 3.1 Gate 2: but if the caller IS authenticated, their own
+        # identity must win — an authenticated user must never be able to
+        # activate/check beta status for a different account by just naming
+        # it in the request body. That was the actual bug: account =
+        # data.get("account") OR user.username let a logged-in caller's
+        # body override their own server-derived identity.
         if path == "/v1/beta/activate" and method == "POST":
             _b = self._require_beta()
             if _b:
                 return _b
-            account = data.get("account") or (user.username if user else "")
+            account = user.username if user else (data.get("account") or "")
             if not account:
                 return 400, {"ok": False, "error": "account required"}
             result = self.beta.activate(
@@ -209,9 +218,18 @@ class PearService:
             _b = self._require_beta()
             if _b:
                 return _b
-            account = data.get("account") or (user.username if user else "")
+            # PEAR 3.1 Gate 2: this endpoint takes no credential at all (no
+            # code, just account+device) — it was previously pure IDOR,
+            # letting anyone probe any account's beta status by name.
+            # Authenticated callers may only ever check their own account;
+            # unauthenticated callers get a generic response with no
+            # account-existence signal.
+            if user is not None:
+                account = user.username
+            else:
+                return 200, {"ok": False, "error": "no active beta license"}
             result = self.beta.check_access(
-                account or "",
+                account,
                 str(data.get("device_id") or ""),
                 platform=str(data.get("platform") or ""),
                 app_version=str(data.get("app_version") or ""),
@@ -309,7 +327,22 @@ class PearService:
 
         if path.startswith("/v1/goals/") and method == "GET":
             gid = path.split("/")[-1]
-            return 200, {"ok": True, "report": orch.goals.status_report(gid), "goal": orch.goals.get(gid).to_dict()}
+            try:
+                goal = orch.goals.get(gid)
+            except KeyError:
+                return 404, {"ok": False, "error": f"unknown goal: {gid}"}
+            # PEAR 3.1 Gate 2: explicit ownership check using the user_id
+            # Gate 4 added to Goal, rather than relying only on the fact
+            # that orch is already scoped to this user (structurally true
+            # today, but this check keeps holding even if goal storage is
+            # ever centralized/refactored later). Also finally gives
+            # authorize_resource() a real caller instead of sitting dead.
+            if goal.user_id is not None:
+                try:
+                    self.auth.authorize_resource(user, resource_owner=goal.user_id)
+                except PermissionError:
+                    return 404, {"ok": False, "error": f"unknown goal: {gid}"}
+            return 200, {"ok": True, "report": orch.goals.status_report(gid), "goal": goal.to_dict()}
 
         if path == "/v1/jobs" and method == "GET":
             try:

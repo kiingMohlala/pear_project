@@ -15,6 +15,7 @@ import threading
 import time
 from pathlib import Path
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -147,15 +148,18 @@ def test_gate1_sequential_construction_does_not_swap_global():
         assert fallback is not tracer_b
 
 
-def _goal_create(port: int, token: str, objective: str) -> dict:
+def _goal_create(port: int, token: str, objective: str) -> tuple:
     req = Request(
         f"http://127.0.0.1:{port}/v1/goals",
         data=json.dumps({"objective": objective}).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST",
     )
-    with urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except HTTPError as e:
+        return e.code, json.loads(e.read().decode())
 
 
 # ── Gate 4: explicit ownership propagation ───────────────────────────
@@ -167,8 +171,8 @@ def test_gate4_goal_stamped_with_owner_over_http():
             token_demo = _login(port, "demo", "demo")
             token_admin = _login(port, "admin", "admin")
 
-            g_demo = _goal_create(port, token_demo, "demo's private goal")
-            g_admin = _goal_create(port, token_admin, "admin's private goal")
+            _, g_demo = _goal_create(port, token_demo, "demo's private goal")
+            _, g_admin = _goal_create(port, token_admin, "admin's private goal")
 
             assert g_demo["goal"]["user_id"] == "demo"
             assert g_admin["goal"]["user_id"] == "admin"
@@ -240,6 +244,204 @@ def test_gate4_ownership_survives_restart():
         assert reloaded_goal.user_id == "carol", "goal ownership lost across restart"
 
 
+def _get(port: int, token: str, path: str) -> tuple:
+    req = Request(f"http://127.0.0.1:{port}{path}", headers={"Authorization": f"Bearer {token}"} if token else {}, method="GET")
+    try:
+        with urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+
+def _post(port: int, token: str, path: str, body: dict) -> tuple:
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(), headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+
+# ── Gate 2: resource ownership / IDOR protection ──────────────────────
+
+def test_gate2_cross_user_goal_access_denied():
+    """User A creates a goal; a genuinely different non-admin User B
+    requesting it by ID must be denied, and the denial must look
+    identical to 'does not exist' (404, not 403) so the response itself
+    can't be used to enumerate other users' resource IDs."""
+    from service.auth import Role
+    with tempfile.TemporaryDirectory() as td:
+        service, httpd, port = _start_server(Path(td))
+        try:
+            service.auth.create_user("eve", "eve-pw", Role.USER)
+            token_demo = _login(port, "demo", "demo")
+            token_eve = _login(port, "eve", "eve-pw")
+
+            status, created = _goal_create(port, token_demo, "demo private goal")
+            assert status == 200
+            gid = created["goal"]["id"]
+
+            # owner can read it
+            status, body = _get(port, token_demo, f"/v1/goals/{gid}")
+            assert status == 200 and body["ok"] is True
+
+            # a different non-admin user cannot — and gets the same 404
+            # shape as a nonexistent id, not a 403 that would confirm the
+            # resource exists.
+            status, body = _get(port, token_eve, f"/v1/goals/{gid}")
+            assert status == 404, f"expected 404 (indistinguishable from not-found), got {status}: {body}"
+            assert body["ok"] is False
+        finally:
+            httpd.shutdown()
+
+
+def test_gate2_authorize_resource_admin_bypass_works_at_the_check_level():
+    """
+    authorize_resource() itself correctly bypasses ownership for ADMIN —
+    verified directly, not through HTTP.
+
+    Important finding, documented rather than silently worked around:
+    /v1/goals/<gid> can't actually exercise this bypass end-to-end today.
+    Every user (including admin) is routed to their OWN per-user
+    Orchestrator via SessionManager, and that orchestrator's goals dict
+    structurally never contains another user's goals — admin gets a 404
+    from orch.goals.get(gid) before authorize_resource() is even reached,
+    same as any other user. So right now admin can't inspect another
+    user's goal via this route despite the auth-layer bypass existing and
+    working correctly. Fixing that needs an actual cross-session resource
+    lookup path for admins, which doesn't exist anywhere yet — that's a
+    real design decision (a new admin capability), not a one-line fix,
+    so it's logged rather than built here.
+    """
+    from service.auth import AuthManager, Role
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as td:
+        auth = AuthManager(persist_path=Path(td) / "users.json")
+        admin = auth.login("admin", "admin")
+        demo = auth.login("demo", "demo")
+        assert admin.role == Role.ADMIN
+
+        # Admin bypasses ownership entirely.
+        result = auth.authorize_resource(admin, resource_owner="demo")
+        assert result.username == "admin"
+
+        # A non-admin does not.
+        try:
+            auth.authorize_resource(demo, resource_owner="someone-else")
+            assert False, "expected PermissionError"
+        except PermissionError:
+            pass
+
+        # Owner accessing their own resource is fine.
+        result = auth.authorize_resource(demo, resource_owner="demo")
+        assert result.username == "demo"
+
+
+def test_gate2_admin_cannot_reach_another_users_goal_via_http_today():
+    """
+    Documents the current, real behavior confirmed above: even admin gets
+    404 on another user's goal via /v1/goals/<gid>, because resource
+    lookup is scoped to admin's own per-user Orchestrator before
+    authorize_resource() is ever consulted. This is not a regression from
+    this gate's changes — verified true against the pre-3.1 code too. It's
+    a genuine gap between the admin-bypass the auth layer supports and
+    what any current route can actually reach.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        service, httpd, port = _start_server(Path(td))
+        try:
+            token_demo = _login(port, "demo", "demo")
+            token_admin = _login(port, "admin", "admin")
+
+            status, created = _goal_create(port, token_demo, "demo private goal 2")
+            assert status == 200
+            gid = created["goal"]["id"]
+
+            status, body = _get(port, token_admin, f"/v1/goals/{gid}")
+            assert status == 404, (
+                "if this now returns 200, an admin cross-session lookup path "
+                "was added — update this test's docstring and assertions to "
+                "match the new intended behavior"
+            )
+        finally:
+            httpd.shutdown()
+
+
+def _fixed_beta_route_returns():
+    """
+    Exercises the actual bug that was fixed in service/app.py's
+    /v1/beta/activate and /v1/beta/status handlers: a minimal stub
+    standing in for the real (gitignored, not-in-this-repo) BetaManager,
+    just enough surface to prove the ROUTE no longer trusts a
+    client-supplied 'account' over the server-derived identity.
+    """
+    class _StubBeta:
+        def __init__(self):
+            self.activations = {}
+
+        def activate(self, code, *, account, device_id, platform, app_version):
+            self.activations[account] = {"code": code, "device_id": device_id}
+            return {"ok": True, "key_id": "bk_stub", "expires_at": 0}
+
+        def check_access(self, account, device_id, platform="", app_version=""):
+            if account in self.activations:
+                return {"ok": True, "key_id": "bk_stub", "expires_at": 0}
+            return {"ok": False, "error": "no active beta license"}
+
+    return _StubBeta
+
+
+def test_gate2_beta_activate_ignores_client_supplied_account_when_authenticated():
+    with tempfile.TemporaryDirectory() as td:
+        service, httpd, port = _start_server(Path(td))
+        service.beta = _fixed_beta_route_returns()()
+        try:
+            token_demo = _login(port, "demo", "demo")
+
+            # demo is authenticated, but tries to activate the code under a
+            # DIFFERENT account in the request body. The route must ignore
+            # that and bind it to demo's own authenticated identity.
+            status, body = _post(port, token_demo, "/v1/beta/activate", {
+                "code": "PEAR-AAAA-BBBB-CCCC",
+                "account": "admin",  # attempted impersonation
+                "device_id": "dev1",
+            })
+            assert status == 200 and body["ok"] is True
+            assert "admin" not in service.beta.activations, "impersonation succeeded — account override was honored"
+            assert "demo" in service.beta.activations, "activation should have bound to the authenticated caller"
+        finally:
+            httpd.shutdown()
+
+
+def test_gate2_beta_status_cannot_probe_other_accounts():
+    with tempfile.TemporaryDirectory() as td:
+        service, httpd, port = _start_server(Path(td))
+        stub = _fixed_beta_route_returns()()
+        stub.activations["admin"] = {"code": "x", "device_id": "d"}  # admin has a license
+        service.beta = stub
+        try:
+            token_demo = _login(port, "demo", "demo")
+
+            # demo has no license of their own, and must not be able to
+            # learn admin's license status by naming "admin" in the body.
+            status, body = _post(port, token_demo, "/v1/beta/status", {
+                "account": "admin", "device_id": "d",
+            })
+            assert status == 200
+            assert body["ok"] is False, "demo was able to read admin's beta status by naming the account"
+
+            # demo checking their own (nonexistent) status is fine and
+            # correctly reports no license.
+            status, body = _post(port, token_demo, "/v1/beta/status", {"device_id": "d"})
+            assert body["ok"] is False
+        finally:
+            httpd.shutdown()
+
+
 if __name__ == "__main__":
     test_gate1_concurrent_traces_no_cross_user_leak()
     print("  ✓ gate1 concurrent traces — no cross-user leak")
@@ -251,4 +453,14 @@ if __name__ == "__main__":
     print("  ✓ gate4 job/goal/workflow/dispatch stamped with owner")
     test_gate4_ownership_survives_restart()
     print("  ✓ gate4 ownership survives restart")
+    test_gate2_cross_user_goal_access_denied()
+    print("  ✓ gate2 cross-user goal access denied (404, not 403)")
+    test_gate2_authorize_resource_admin_bypass_works_at_the_check_level()
+    print("  ✓ gate2 authorize_resource() admin bypass correct at check level")
+    test_gate2_admin_cannot_reach_another_users_goal_via_http_today()
+    print("  ✓ gate2 documented: admin cross-session lookup gap (not fixed here)")
+    test_gate2_beta_activate_ignores_client_supplied_account_when_authenticated()
+    print("  ✓ gate2 beta activate ignores client-supplied account override")
+    test_gate2_beta_status_cannot_probe_other_accounts()
+    print("  ✓ gate2 beta status cannot probe other accounts")
     print("All PEAR 3.1 security tests passed (gates implemented so far).")
