@@ -49,9 +49,20 @@ not just "code written."
   fix). Found but not fixed: `WorkerManager` computes a `persist_dir` but
   has zero save/load calls anywhere — dispatches don't survive restart at
   all, independent of ownership. Flagged below for Gate 7.
-- 🟡 Gate 5 — Worker identity propagation. Not started. `_run_remote()`
-  still drops `session_user` before it reaches the remote endpoint
-  (confirmed in the architecture audit, not yet fixed).
+- 🟢 **Gate 5 — Worker identity propagation.** Fixed in `fd51818`.
+  `_run_remote_inner` was sending only `{"message": objective}` plus the
+  worker's own stored bearer token — the originating user's identity
+  never reached the remote side or any audit trail. Added
+  `origin_user_id`/`dispatch_id` to the outbound payload, explicitly as
+  informational metadata, not a credential — commented directly in the
+  code that the bearer token remains the only thing that actually
+  authenticates the request, since conflating those two is exactly what
+  Gate 2 found and fixed in the beta routes. Two of the gate's other
+  required properties (retry preserves ownership; a spoofed identity in
+  a remote response can't override local ownership) were already true by
+  construction — locked in with tests, not "fixed" since there was
+  nothing to fix. "Ownership survives restart" doesn't apply here yet —
+  same WorkerManager persistence gap already logged under Gate 4/7.
 - 🟡 Gate 6 — Session lifecycle (eviction). Not started.
 - 🟡 Gate 7 — Persistence/recovery audit. Not started as its own pass, but
   now has two concrete items queued: WorkerManager's missing persistence
