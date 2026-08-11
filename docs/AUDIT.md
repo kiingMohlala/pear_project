@@ -38,7 +38,22 @@ not just "code written."
   predates Gate 2 (tested directly against `SessionManager`). Needs an
   actual cross-session resource-lookup path for admins — a real design
   decision, not queued to a specific gate yet.
-- 🟡 Gate 3 — Credential isolation. Not started.
+- 🟢 **Gate 3 — Credential isolation.** Fixed in `3605778`. `CredentialStore`
+  defaulted to one process-wide file+key (`~/.pear/credentials.enc` /
+  `.cred_key`) no matter who constructed it. Confirmed the actual
+  corruption this caused: without the fix, a second user connecting the
+  same connector name overwrites the first user's stored token in the
+  shared file — proved with a real before/after test. Fixed by deriving
+  the encryption key alongside the (now per-user) data file rather than
+  always defaulting to the global one, and threading a per-user path from
+  `Orchestrator` through `build_default_connectors()`, same pattern as
+  the tracer (Gate 1) and `user_id` (Gate 4). Also verified: no raw
+  credential values leak into `auth_status()`/`health()`/`/v1/connectors`,
+  and n8n's zero-config optional behavior is undisturbed. Noted honestly
+  in the commit: the required concurrent-multi-user test stresses the
+  fix's own thread-safety but doesn't independently prove the original
+  bug (each thread's in-memory cache masks it) — the other two tests do
+  that unambiguously.
 - 🟢 **Gate 4 — Explicit ownership propagation.** Fixed in `f108bf5`.
   `Orchestrator` now carries `self.user_id`, set once at construction by
   `SessionManager`. `Job`, `Goal`, and `WorkflowRun` all gained a `user_id`
