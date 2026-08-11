@@ -15,11 +15,32 @@ from typing import Any, Dict, Optional
 
 
 class CredentialStore:
-    def __init__(self, path: Optional[Path] = None):
-        base = Path.home() / ".pear"
-        base.mkdir(parents=True, exist_ok=True)
-        self.path = Path(path) if path else base / "credentials.enc"
-        self.key_path = base / ".cred_key"
+    """
+    PEAR 3.1 Gate 3: this used to always default to a single, process-wide
+    location (~/.pear/credentials.enc, ~/.pear/.cred_key), regardless of
+    who constructed it — meaning every user's ConnectorRegistry shared one
+    file, keyed only by connector name, not by user. Pass an explicit
+    `path` (and this now derives a matching, equally-scoped `key_path`
+    alongside it, in the same directory, unless overridden) to get a
+    properly isolated per-user/per-workspace store. See
+    core/connectors/__init__.py's build_default_connectors() and
+    core/orchestrator.py for how the per-user path actually gets threaded
+    through.
+    """
+
+    def __init__(self, path: Optional[Path] = None, key_path: Optional[Path] = None):
+        if path is not None:
+            self.path = Path(path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Key lives alongside the (possibly per-user) data file by
+            # default — NOT always ~/.pear — so a per-user path also gets
+            # a per-user key, not the same shared key everyone else uses.
+            self.key_path = Path(key_path) if key_path else self.path.parent / ".cred_key"
+        else:
+            base = Path.home() / ".pear"
+            base.mkdir(parents=True, exist_ok=True)
+            self.path = base / "credentials.enc"
+            self.key_path = Path(key_path) if key_path else base / ".cred_key"
         self._key = self._load_or_create_key()
         self._data: Dict[str, Dict[str, Any]] = {}
         self._load()

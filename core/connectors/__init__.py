@@ -1,3 +1,5 @@
+from typing import Optional
+
 from .base import Connector, ConnectorCapability, ConnectorResult, ConnectorStatus
 from .credentials import CredentialStore
 from .registry import ConnectorRegistry
@@ -13,8 +15,8 @@ from .jira_connector import JiraConnector
 from .quant_connector import QuantConnector
 
 
-def build_default_connectors(workspace=None) -> ConnectorRegistry:
-    reg = ConnectorRegistry()
+def build_default_connectors(workspace=None, credential_store: Optional[CredentialStore] = None) -> ConnectorRegistry:
+    reg = ConnectorRegistry(credential_store=credential_store)
     reg.register(LocalFilesConnector(workspace=workspace))
     reg.register(EmailConnector())
     reg.register(CalendarConnector())

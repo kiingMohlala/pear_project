@@ -595,6 +595,127 @@ def test_gate5_retry_preserves_ownership_local_and_remote():
         httpd.shutdown()
 
 
+# ── Gate 3: credential isolation ───────────────────────────────────────
+
+def test_gate3_credentials_scoped_per_user_not_shared_globally():
+    """Two users' CredentialStores must be genuinely separate files (and
+    separate encryption keys), not the same global ~/.pear location keyed
+    only by connector name."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice = sm.get("alice").orchestrator
+        bob = sm.get("bob").orchestrator
+
+        assert alice.connectors.credentials.path != bob.connectors.credentials.path
+        assert alice.connectors.credentials.key_path != bob.connectors.credentials.key_path
+
+        alice.connectors.credentials.set("notion", {"token": "alice-secret"})
+        bob.connectors.credentials.set("notion", {"token": "bob-secret"})
+
+        assert alice.connectors.credentials.get("notion")["token"] == "alice-secret"
+        assert bob.connectors.credentials.get("notion")["token"] == "bob-secret"
+
+        # User A cannot use User B's connector credentials — same connector
+        # NAME ("notion") resolves to a completely different underlying
+        # credential depending on whose orchestrator asks.
+        assert alice.connectors.credentials.get("notion") != bob.connectors.credentials.get("notion")
+
+
+def test_gate3_credentials_survive_restart_still_isolated():
+    """Ownership-style check for credentials specifically: rebuild
+    SessionManager from scratch against the same on-disk data_root and
+    confirm each user still only sees their own stored credential."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        data_root = Path(td)
+        sm1 = SessionManager(data_root=data_root, llm=EchoLLM())
+        sm1.get("alice").orchestrator.connectors.credentials.set("github", {"token": "alice-gh"})
+        sm1.get("bob").orchestrator.connectors.credentials.set("github", {"token": "bob-gh"})
+
+        sm2 = SessionManager(data_root=data_root, llm=EchoLLM())
+        alice2 = sm2.get("alice").orchestrator
+        bob2 = sm2.get("bob").orchestrator
+        assert alice2.connectors.credentials.get("github")["token"] == "alice-gh"
+        assert bob2.connectors.credentials.get("github")["token"] == "bob-gh"
+
+
+def test_gate3_concurrent_multi_user_credential_isolation():
+    """Required by the task card explicitly. Many threads, each acting as
+    a different authenticated user, concurrently write and read back a
+    connector credential. No thread may ever observe another user's
+    value, under real concurrent access — not just sequential calls."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        users = [f"user{i}" for i in range(12)]
+        errors = []
+
+        def worker(username):
+            try:
+                orch = sm.get(username).orchestrator
+                secret = f"{username}-secret-token"
+                for _ in range(15):
+                    orch.connectors.credentials.set("slack", {"token": secret})
+                    got = orch.connectors.credentials.get("slack")
+                    if got["token"] != secret:
+                        errors.append(f"{username} saw {got['token']!r} instead of its own {secret!r}")
+            except Exception as e:
+                errors.append(f"{username}: {e}")
+
+        threads = [threading.Thread(target=worker, args=(u,)) for u in users]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, "cross-user credential leakage under concurrency:\n" + "\n".join(errors)
+
+        # final check: every user's store still holds only its own value
+        for u in users:
+            got = sm.get(u).orchestrator.connectors.credentials.get("slack")
+            assert got["token"] == f"{u}-secret-token"
+
+
+def test_gate3_no_credential_values_in_api_response_or_status():
+    """auth_status()/health() must never include raw credential values —
+    only metadata (which keys exist, when updated), matching the pattern
+    the code already used for connector status."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        orch = sm.get("alice").orchestrator
+        orch.connectors.credentials.set("notion", {"token": "super-secret-value-xyz"})
+
+        status = orch.connectors.auth_status()
+        dumped = json.dumps(status)
+        assert "super-secret-value-xyz" not in dumped
+
+    with tempfile.TemporaryDirectory() as td2:
+        service, httpd, port = _start_server(Path(td2))
+        try:
+            token = _login(port, "demo", "demo")
+            sess = service.sessions.get("demo")
+            sess.orchestrator.connectors.credentials.set("notion", {"token": "http-leak-check-999"})
+            status, body = _get(port, token, "/v1/connectors")
+            assert status == 200
+            assert "http-leak-check-999" not in json.dumps(body)
+        finally:
+            httpd.shutdown()
+
+
+def test_gate3_n8n_optionality_preserved():
+    """Gate 3 must not disturb n8n's documented optional behavior — it
+    should construct and report cleanly with zero configuration."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        orch = sm.get("alice").orchestrator
+        assert orch.connectors.has("n8n")
+        health = orch.connectors.get("n8n").health()
+        assert health["status"] == "disconnected"  # not configured, not an error
+
+
 if __name__ == "__main__":
     test_gate1_concurrent_traces_no_cross_user_leak()
     print("  ✓ gate1 concurrent traces — no cross-user leak")
@@ -622,4 +743,14 @@ if __name__ == "__main__":
     print("  ✓ gate5 spoofed remote response cannot override ownership")
     test_gate5_retry_preserves_ownership_local_and_remote()
     print("  ✓ gate5 retry preserves ownership (local + remote)")
+    test_gate3_credentials_scoped_per_user_not_shared_globally()
+    print("  ✓ gate3 credentials scoped per user")
+    test_gate3_credentials_survive_restart_still_isolated()
+    print("  ✓ gate3 credentials survive restart, still isolated")
+    test_gate3_concurrent_multi_user_credential_isolation()
+    print("  ✓ gate3 concurrent multi-user credential isolation")
+    test_gate3_no_credential_values_in_api_response_or_status()
+    print("  ✓ gate3 no credential values leak into responses")
+    test_gate3_n8n_optionality_preserved()
+    print("  ✓ gate3 n8n optionality preserved")
     print("All PEAR 3.1 security tests passed (gates implemented so far).")

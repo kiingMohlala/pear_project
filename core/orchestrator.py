@@ -124,7 +124,20 @@ class Orchestrator:
             ws = Workspace()
         except Exception:
             ws = None
-        self.connectors = build_default_connectors(workspace=ws)
+
+        # PEAR 3.1 Gate 3: credentials scoped per-user, same pattern as
+        # jobs.sqlite/traces.sqlite/workflows above. Falls back to the old
+        # global ~/.pear location only when there's no per-user persist_dir
+        # at all (e.g. a bare Orchestrator built without Memory persistence,
+        # such as in quick scripts/tests) — matching how every other
+        # per-user subsystem here already degrades.
+        cred_store = None
+        if getattr(self.memory, "persist_dir", None):
+            from pathlib import Path as _P
+            from .connectors import CredentialStore
+            cred_path = _P(self.memory.persist_dir) / "credentials.enc"
+            cred_store = CredentialStore(path=cred_path)
+        self.connectors = build_default_connectors(workspace=ws, credential_store=cred_store)
         media_dir = None
         if getattr(self.memory, "persist_dir", None):
             from pathlib import Path as _P
