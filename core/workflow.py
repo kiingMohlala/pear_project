@@ -663,19 +663,19 @@ class WorkflowRunner:
         return self.persist_dir / "runs" / f"{run_id}.json"
 
     def _save_definition(self, wf: Workflow) -> None:
+        from core.security import atomic_write_text
         path = self._def_path(wf.name)
         if not path:
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(wf.to_dict(), indent=2), encoding="utf-8")
+        atomic_write_text(path, json.dumps(wf.to_dict(), indent=2))
 
     def _save_run(self, run: WorkflowRun) -> None:
+        from core.security import atomic_write_text
         run.touch()
         path = self._run_path(run.id)
         if not path:
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(run.to_dict(), indent=2), encoding="utf-8")
+        atomic_write_text(path, json.dumps(run.to_dict(), indent=2))
 
     def _load_definitions(self) -> None:
         if not self.persist_dir:
@@ -684,12 +684,16 @@ class WorkflowRunner:
         if not ddir.exists():
             return
         for path in ddir.glob("*.json"):
+            from core.security import safe_load_text, quarantine_corrupt_file
+            raw = safe_load_text(path, on_corrupt_label=f"workflow definition {path.name}")
+            if raw is None:
+                continue
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(raw)
                 wf = Workflow.from_dict(data)
                 self.definitions[wf.name] = wf
-            except Exception:
-                continue
+            except Exception as e:
+                quarantine_corrupt_file(path, f"workflow definition {path.name} (parsed but bad shape)", e)
 
     def _load_runs(self) -> None:
         if not self.persist_dir:
@@ -698,15 +702,19 @@ class WorkflowRunner:
         if not rdir.exists():
             return
         for path in rdir.glob("*.json"):
+            from core.security import safe_load_text, quarantine_corrupt_file
+            raw = safe_load_text(path, on_corrupt_label=f"workflow run {path.name}")
+            if raw is None:
+                continue
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(raw)
                 run = WorkflowRun.from_dict(data)
                 # interrupted running → paused for recovery
                 if run.status == WorkflowStatus.RUNNING:
                     run.status = WorkflowStatus.PAUSED
                 self.runs[run.id] = run
-            except Exception:
-                continue
+            except Exception as e:
+                quarantine_corrupt_file(path, f"workflow run {path.name} (parsed but bad shape)", e)
 
     def _checkpoint(self, run: WorkflowRun) -> None:
         run.checkpoint = {

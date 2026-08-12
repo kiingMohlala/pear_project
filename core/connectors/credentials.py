@@ -93,18 +93,24 @@ class CredentialStore:
             raise ValueError(f"Cannot decrypt credentials: {e}") from e
 
     def _load(self) -> None:
-        if not self.path.exists():
+        from core.security import safe_load_bytes
+        raw = safe_load_bytes(self.path, on_corrupt_label="connector credential store")
+        if raw is None:
             self._data = {}
             return
         try:
-            plain = self._decrypt(self.path.read_bytes())
+            plain = self._decrypt(raw)
             self._data = json.loads(plain.decode("utf-8"))
-        except Exception:
+        except Exception as e:
+            import sys
+            from core.security import quarantine_corrupt_file
+            quarantine_corrupt_file(self.path, "connector credential store (decrypt/parse failed)", e)
             self._data = {}
 
     def _save(self) -> None:
+        from core.security import atomic_write_bytes
         payload = json.dumps(self._data).encode("utf-8")
-        self.path.write_bytes(self._encrypt(payload))
+        atomic_write_bytes(self.path, self._encrypt(payload))
         try:
             os.chmod(self.path, 0o600)
         except OSError:

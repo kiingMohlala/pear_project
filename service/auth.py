@@ -117,10 +117,12 @@ class AuthManager:
     # ── persistence ───────────────────────────────────────────────
 
     def _load(self) -> None:
-        if not self.persist_path.exists():
+        from core.security import safe_load_text, quarantine_corrupt_file
+        raw = safe_load_text(self.persist_path, on_corrupt_label="auth user database")
+        if raw is None:
             return
         try:
-            data = json.loads(self.persist_path.read_text(encoding="utf-8"))
+            data = json.loads(raw)
             for u in data.get("users") or []:
                 self.users[u["username"]] = User(
                     username=u["username"],
@@ -132,10 +134,11 @@ class AuthManager:
                     failed_logins=int(u.get("failed_logins") or 0),
                     locked_until=float(u.get("locked_until") or 0),
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            quarantine_corrupt_file(self.persist_path, "auth user database (parsed but bad shape)", e)
 
     def _save(self) -> None:
+        from core.security import atomic_write_text
         data = {
             "users": [
                 {
@@ -151,26 +154,29 @@ class AuthManager:
                 for u in self.users.values()
             ]
         }
-        self.persist_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        atomic_write_text(self.persist_path, json.dumps(data, indent=2))
 
     def _load_sessions(self) -> None:
-        if not self.sessions_path.exists():
+        from core.security import safe_load_text, quarantine_corrupt_file
+        raw = safe_load_text(self.sessions_path, on_corrupt_label="auth session store")
+        if raw is None:
             return
         try:
-            data = json.loads(self.sessions_path.read_text(encoding="utf-8"))
+            data = json.loads(raw)
             for s in data.get("sessions") or []:
                 sess = Session.from_dict(s)
                 self.sessions[sess.token] = sess
             self.revoked_tokens = set(data.get("revoked") or [])
-        except Exception:
-            pass
+        except Exception as e:
+            quarantine_corrupt_file(self.sessions_path, "auth session store (parsed but bad shape)", e)
 
     def _save_sessions(self) -> None:
+        from core.security import atomic_write_text
         data = {
             "sessions": [s.to_dict() for s in self.sessions.values() if not s.revoked],
             "revoked": list(self.revoked_tokens)[-500:],
         }
-        self.sessions_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        atomic_write_text(self.sessions_path, json.dumps(data, indent=2))
 
     # ── users ─────────────────────────────────────────────────────
 

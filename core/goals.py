@@ -199,16 +199,23 @@ class GoalManager:
         return self.persist_dir / f"{goal_id}.json"
 
     def _save(self, goal: Goal) -> None:
+        from core.security import atomic_write_text
         goal.updated_at = time.time()
-        self._path(goal.id).write_text(json.dumps(goal.to_dict(), indent=2), encoding="utf-8")
+        atomic_write_text(self._path(goal.id), json.dumps(goal.to_dict(), indent=2))
 
     def _load_all(self) -> None:
+        from core.security import safe_load_text
         for p in self.persist_dir.glob("goal_*.json"):
-            try:
-                g = Goal.from_dict(json.loads(p.read_text(encoding="utf-8")))
-                self.goals[g.id] = g
-            except Exception:
+            raw = safe_load_text(p, on_corrupt_label=f"goal file {p.name}")
+            if raw is None:
                 continue
+            try:
+                g = Goal.from_dict(json.loads(raw))
+                self.goals[g.id] = g
+            except Exception as e:
+                import sys
+                from core.security import quarantine_corrupt_file
+                quarantine_corrupt_file(p, f"goal file {p.name} (parsed but bad shape)", e)
 
     # ── events / tracing ──────────────────────────────────────────
 

@@ -19,6 +19,100 @@ ALLOWED_UPLOAD_MIME_PREFIXES = ("application/pdf", "text/", "image/", "applicati
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
+# ── PEAR 3.1 Gate 7: atomic persistence + honest corruption handling ────
+#
+# Several stores (auth users/sessions, connector credentials, goals,
+# workflows) wrote their state with a plain path.write_text()/write_bytes()
+# — which truncates the file before writing the new content. A crash or
+# kill mid-write leaves a half-written, corrupted file. Worse, every one
+# of those stores' load path wrapped the read in a bare `except Exception:
+# pass` (or `self._data = {}`), which can't tell "file doesn't exist yet"
+# (normal, first run) apart from "file exists but is corrupted" (a real
+# incident) — both were handled by silently proceeding as if the store
+# were empty. For the auth user database specifically, that's a silent,
+# total lockout: every account just vanishes with no error anywhere.
+#
+# atomic_write_bytes/atomic_write_text: write to a temp file in the same
+# directory, then os.replace() — atomic on POSIX and Windows, so the
+# final file is always either fully the old version or fully the new one,
+# never a partial write.
+#
+# safe_load: distinguishes "no file" from "file exists but unreadable",
+# and for the latter preserves a timestamped .corrupted-<ts> backup next
+# to it before the caller falls back to empty/default state, so there's
+# at least a chance at forensic recovery instead of the bytes just being
+# gone.
+
+def atomic_write_bytes(path: "Path", data: bytes) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def atomic_write_text(path: "Path", text: str, encoding: str = "utf-8") -> None:
+    atomic_write_bytes(path, text.encode(encoding))
+
+
+def safe_load_text(path: "Path", *, on_corrupt_label: str = "store") -> Optional[str]:
+    """
+    Returns the file's text, or None if it doesn't exist (normal — caller
+    should proceed with default/empty state, no warning needed). If the
+    file exists but can't be read, backs it up to a .corrupted-<ts>
+    sibling, prints a loud warning (this is a real incident, not a
+    first-run case), and returns None so the caller still degrades
+    gracefully rather than crashing the whole service.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as e:
+        quarantine_corrupt_file(path, on_corrupt_label, e)
+        return None
+
+
+def safe_load_bytes(path: "Path", *, on_corrupt_label: str = "store") -> Optional[bytes]:
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return path.read_bytes()
+    except Exception as e:
+        quarantine_corrupt_file(path, on_corrupt_label, e)
+        return None
+
+
+def quarantine_corrupt_file(path: "Path", label: str, error: Exception) -> None:
+    import sys
+    import time as _time
+    backup = path.with_name(f"{path.name}.corrupted-{int(_time.time())}")
+    try:
+        import shutil
+        shutil.copy2(path, backup)
+        note = f"backed up to {backup}"
+    except Exception:
+        note = "backup ALSO failed — original file left in place, untouched"
+    print(
+        f"[PEAR] WARNING: {label} at {path} exists but could not be read ({error}). "
+        f"Proceeding with empty/default state; {note}. This needs manual investigation — "
+        f"data loss is possible.",
+        file=sys.stderr,
+    )
+
+
 def sanitize_string(value: Any, max_len: int = 10_000) -> str:
     if value is None:
         return ""

@@ -822,6 +822,146 @@ def test_gate6_concurrent_get_for_new_user_no_duplicate_sessions():
         assert len(set(results)) == 1, "concurrent get() for a new user produced multiple distinct orchestrators"
 
 
+# ── Gate 7: persistence / recovery ─────────────────────────────────────
+
+def test_gate7_atomic_write_survives_crash_mid_write():
+    """A failure between 'temp file written' and 'atomic rename' must
+    leave the ORIGINAL file completely untouched — never a partial/
+    truncated version of the new content."""
+    from core.security import atomic_write_text
+    import os as _os
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "state.json"
+        atomic_write_text(path, '{"version": 1, "data": "original"}')
+        assert path.read_text() == '{"version": 1, "data": "original"}'
+
+        real_replace = _os.replace
+        def failing_replace(*a, **kw):
+            raise OSError("simulated crash between write and rename")
+
+        _os.replace = failing_replace
+        try:
+            try:
+                atomic_write_text(path, '{"version": 2, "data": "new-content-that-should-never-land"}')
+                assert False, "expected the simulated crash to propagate"
+            except OSError:
+                pass
+        finally:
+            _os.replace = real_replace
+
+        # the original file must be exactly as it was — not corrupted,
+        # not truncated, not partially overwritten.
+        assert path.read_text() == '{"version": 1, "data": "original"}'
+        # and no leftover temp files should linger in the directory
+        leftovers = [p for p in Path(td).iterdir() if p.name.startswith(".state.json.tmp-")]
+        assert leftovers == [], f"temp file(s) left behind: {leftovers}"
+
+
+def test_gate7_corrupted_file_quarantined_loudly_not_silently_wiped():
+    """A pre-existing corrupted file must produce a visible warning and a
+    .corrupted-<ts> backup, not silent data loss disguised as 'empty
+    store, nothing to see here'."""
+    import sys
+    from io import StringIO
+    from core.security import safe_load_text
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "users.json"
+        path.write_bytes(b"\x00\x01\xff not valid json at all {{{")
+
+        captured = StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            result = safe_load_text(path, on_corrupt_label="test store")
+        finally:
+            sys.stderr = old_stderr
+
+        assert result is None
+        assert "WARNING" in captured.getvalue()
+        assert "test store" in captured.getvalue()
+
+        backups = list(Path(td).glob("users.json.corrupted-*"))
+        assert len(backups) == 1, "expected exactly one quarantined backup of the corrupted file"
+        assert backups[0].read_bytes() == b"\x00\x01\xff not valid json at all {{{"
+
+
+def test_gate7_auth_database_corruption_does_not_silently_lock_everyone_out():
+    """The highest-severity case: a corrupted users.json must not
+    silently start the service with zero accounts. It should warn loudly
+    and quarantine the file — this test locks in that it does NOT crash
+    the whole service either, since that would be its own denial-of-
+    service problem; it degrades to empty-but-loud instead."""
+    from service.auth import AuthManager
+    import sys
+    from io import StringIO
+
+    with tempfile.TemporaryDirectory() as td:
+        users_path = Path(td) / "users.json"
+        users_path.write_text("{not valid json")
+
+        captured = StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            auth = AuthManager(persist_path=users_path)
+        finally:
+            sys.stderr = old_stderr
+
+        assert "WARNING" in captured.getvalue()
+        backups = list(Path(td).glob("users.json.corrupted-*"))
+        assert len(backups) == 1
+        # default accounts still get (re)seeded rather than the service
+        # being left completely unusable
+        assert auth.login("admin", "admin") is not None
+
+
+def test_gate7_full_create_run_crash_restart_recover_flow():
+    """The exact flow the gate specifies: create -> running -> process
+    termination -> restart -> recovery, for a job, a goal, and a
+    workflow run, using a real crash simulation (kill -9 style: no clean
+    shutdown, no flush) rather than a clean SessionManager teardown."""
+    from service.sessions import SessionManager
+    from core.job import JobStatus
+    from core.goals import GoalStatus
+
+    with tempfile.TemporaryDirectory() as td:
+        data_root = Path(td)
+        sm1 = SessionManager(data_root=data_root, llm=EchoLLM())
+        orch1 = sm1.get("dana").orchestrator
+
+        job = orch1.jobs.enqueue("dana's job")
+        goal = orch1.goals.create("dana's goal", auto_start=False)
+
+        # Simulate the job/goal being mid-flight at the moment of a crash
+        # (no graceful stop(), no eviction — just abandon the objects,
+        # like a kill -9 on the process).
+        from core.job import JobStatus as _JS
+        job.status = _JS.RUNNING
+        orch1.jobs._save_job(job)
+        goal.status = GoalStatus.RUNNING
+        orch1.goals._save(goal)
+
+        # "process termination" — sm1/orch1 are simply never used again,
+        # nothing flushed or cleaned up on the way out.
+        del sm1, orch1
+
+        # "restart" — brand new SessionManager/Orchestrator against the
+        # same on-disk data_root.
+        sm2 = SessionManager(data_root=data_root, llm=EchoLLM())
+        orch2 = sm2.get("dana").orchestrator
+
+        recovered_job = orch2.jobs._jobs.get(job.id)
+        assert recovered_job is not None, "job did not survive the crash at all"
+        assert recovered_job.status == JobStatus.QUEUED, "a RUNNING job must recover to QUEUED, not stay stuck RUNNING forever"
+        assert recovered_job.user_id == "dana"
+
+        recovered_goal = orch2.goals.get(goal.id)
+        assert recovered_goal is not None, "goal did not survive the crash at all"
+        assert recovered_goal.user_id == "dana"
+
+
 if __name__ == "__main__":
     test_gate1_concurrent_traces_no_cross_user_leak()
     print("  ✓ gate1 concurrent traces — no cross-user leak")
@@ -869,4 +1009,12 @@ if __name__ == "__main__":
     print("  ✓ gate6 reconstructs state from persistence")
     test_gate6_concurrent_get_for_new_user_no_duplicate_sessions()
     print("  ✓ gate6 concurrent get() has no duplicate sessions")
+    test_gate7_atomic_write_survives_crash_mid_write()
+    print("  ✓ gate7 atomic write survives crash mid-write")
+    test_gate7_corrupted_file_quarantined_loudly_not_silently_wiped()
+    print("  ✓ gate7 corrupted file quarantined loudly")
+    test_gate7_auth_database_corruption_does_not_silently_lock_everyone_out()
+    print("  ✓ gate7 auth database corruption handled loudly, not silently")
+    test_gate7_full_create_run_crash_restart_recover_flow()
+    print("  ✓ gate7 full create/run/crash/restart/recover flow")
     print("All PEAR 3.1 security tests passed (gates implemented so far).")

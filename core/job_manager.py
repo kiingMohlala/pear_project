@@ -123,7 +123,11 @@ class JobManager:
                     job.status = JobStatus.QUEUED
                     job.progress_message = "Recovered after restart"
                 self._jobs[job.id] = job
-            except Exception:
+            except Exception as e:
+                import sys
+                print(f"[PEAR] WARNING: a job row in {self.persist_path} could not be parsed ({e}) and "
+                      f"was skipped — that job is effectively lost. This needs investigation.",
+                      file=sys.stderr)
                 continue
 
     # ── queue API ─────────────────────────────────────────────────
