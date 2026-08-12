@@ -716,6 +716,112 @@ def test_gate3_n8n_optionality_preserved():
         assert health["status"] == "disconnected"  # not configured, not an error
 
 
+# ── Gate 6: session lifecycle ──────────────────────────────────────────
+
+def test_gate6_idle_session_can_be_evicted():
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        sm.get("alice")
+        assert "alice" in sm._sessions
+        # simulate idle by back-dating last_access rather than sleeping
+        sm._sessions["alice"].last_access = time.time() - 10000
+        evicted = sm.evict_idle(max_idle_s=1.0)
+        assert evicted == ["alice"]
+        assert "alice" not in sm._sessions
+
+
+def test_gate6_active_job_blocks_eviction():
+    """An orchestrator with a RUNNING job must not be evicted — active
+    jobs/goals/workflows must not be destroyed."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        orch = sm.get("alice").orchestrator
+
+        gate = threading.Event()
+        orch.jobs.runner = lambda job: gate.wait(5)  # JobManager already
+        # sets job.status = RUNNING before invoking the runner.
+        orch.jobs.enqueue("slow work")
+        orch.jobs.start()
+        time.sleep(0.3)
+
+        assert sm._is_busy(orch) is True
+        assert sm.evict("alice") is False, "active job should have blocked eviction"
+        assert "alice" in sm._sessions
+
+        sm._sessions["alice"].last_access = time.time() - 10000
+        assert sm.evict_idle(max_idle_s=1.0) == [], "evict_idle must also skip busy sessions"
+        assert "alice" in sm._sessions
+
+        gate.set()
+        time.sleep(0.3)
+        orch.jobs.stop()
+
+
+def test_gate6_eviction_releases_resources_cleanly():
+    """Worker threads/executors are actually shut down, not just the dict
+    entry removed."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        orch = sm.get("bob").orchestrator
+        orch.jobs.start()
+        assert orch.jobs._workers, "expected worker threads to have started"
+        assert not orch.workers._executor._shutdown
+
+        assert sm.evict("bob") is True
+        time.sleep(0.2)
+
+        assert all(not t.is_alive() for t in orch.jobs._workers), "job worker threads should be stopped"
+        assert orch.workers._executor._shutdown, "worker thread pool should be shut down"
+
+
+def test_gate6_later_request_reconstructs_state_from_persistence():
+    """login -> create session -> execute work -> idle -> evict ->
+    restart/reconstruct -> state remains correct."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        orch1 = sm.get("carol").orchestrator
+        goal = orch1.goals.create("carol's persistent goal", auto_start=False)
+        goal_id = goal.id
+
+        assert sm.evict("carol") is True
+        assert "carol" not in sm._sessions
+
+        # a later request rebuilds the session from the same data_root
+        orch2 = sm.get("carol").orchestrator
+        assert orch2 is not orch1
+        reloaded = orch2.goals.get(goal_id)
+        assert reloaded.objective == "carol's persistent goal"
+        assert reloaded.user_id == "carol"
+
+
+def test_gate6_concurrent_get_for_new_user_no_duplicate_sessions():
+    """Many threads racing to get() the SAME brand-new user_id must all
+    end up with the identical session/orchestrator, never two competing
+    ones."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        results = []
+        lock = threading.Lock()
+
+        def worker():
+            sess = sm.get("newuser")
+            with lock:
+                results.append(id(sess.orchestrator))
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(set(results)) == 1, "concurrent get() for a new user produced multiple distinct orchestrators"
+
+
 if __name__ == "__main__":
     test_gate1_concurrent_traces_no_cross_user_leak()
     print("  ✓ gate1 concurrent traces — no cross-user leak")
@@ -753,4 +859,14 @@ if __name__ == "__main__":
     print("  ✓ gate3 no credential values leak into responses")
     test_gate3_n8n_optionality_preserved()
     print("  ✓ gate3 n8n optionality preserved")
+    test_gate6_idle_session_can_be_evicted()
+    print("  ✓ gate6 idle session evicted")
+    test_gate6_active_job_blocks_eviction()
+    print("  ✓ gate6 active job blocks eviction")
+    test_gate6_eviction_releases_resources_cleanly()
+    print("  ✓ gate6 eviction releases resources cleanly")
+    test_gate6_later_request_reconstructs_state_from_persistence()
+    print("  ✓ gate6 reconstructs state from persistence")
+    test_gate6_concurrent_get_for_new_user_no_duplicate_sessions()
+    print("  ✓ gate6 concurrent get() has no duplicate sessions")
     print("All PEAR 3.1 security tests passed (gates implemented so far).")
