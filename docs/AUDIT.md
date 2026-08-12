@@ -78,7 +78,18 @@ not just "code written."
   construction — locked in with tests, not "fixed" since there was
   nothing to fix. "Ownership survives restart" doesn't apply here yet —
   same WorkerManager persistence gap already logged under Gate 4/7.
-- 🟡 Gate 6 — Session lifecycle (eviction). Not started.
+- 🟢 **Gate 6 — Session lifecycle (eviction).** Fixed in `ea5e1b4`.
+  `SessionManager` kept every user's Orchestrator (and its threads) alive
+  forever with no eviction path at all. Added `evict()`/`evict_idle()` —
+  both refuse to evict a session with a running job/goal/dispatch, and
+  actually shut down what a session owns (job worker threads joined,
+  worker thread pool shut down) rather than just dropping the dict entry.
+  Added an optional `start_idle_sweeper()` background timer, not started
+  automatically — wiring it into the live service's default startup is a
+  deployment decision, not made unilaterally here. `get()`'s
+  concurrent-request safety needed no fix — the check-then-create was
+  already fully inside the lock — verified explicitly with a 20-thread
+  test rather than assumed.
 - 🟡 Gate 7 — Persistence/recovery audit. Not started as its own pass, but
   now has two concrete items queued: WorkerManager's missing persistence
   (above), and the broad `except: pass` patterns on auth/session file loads
