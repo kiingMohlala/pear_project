@@ -112,8 +112,21 @@ not just "code written."
   zero persistence at all (Gate 4/5 finding) — building that from
   scratch is bigger than hardening what exists and needs its own
   decision.
-- 🟡 Gate 8 — Concurrency testing (30 concurrent users). Not started —
-  intentionally sequenced last among the gates it depends on.
+- 🟢 **Gate 8 — Concurrency testing (30 concurrent users).** Fixed in
+  `0d0f815`. Real adversarial test: 30 concurrent users, each doing chat,
+  goal creation, connector credentials, and worker dispatch at once over
+  a real `ThreadingHTTPServer` — all Gates 1-7's properties exercised
+  simultaneously from the same 30 threads, not just re-run individually,
+  so it can catch interaction effects an isolated test can't. All pass:
+  correct per-user ownership, no cross-user credential or trace leakage,
+  no duplicate sessions, dispatch identities matching 1:1. One real
+  finding worth noting: 2 of 5 initial runs failed with
+  `ConnectionResetError` — not a security bug, but `ThreadingHTTPServer`'s
+  default TCP accept backlog of 5 being nowhere near enough for 30
+  threads bursting connections at once. Fixed the test harness (backlog
+  256, set as a class attribute since `listen()` runs during
+  `__init__` — an instance-attribute assignment after construction is
+  too late), confirmed with 8 consecutive clean runs before trusting it.
 - 🟡 Gate 9 — API surface reconciliation (stdlib vs FastAPI). Not started.
 
 See `tests/test_security_v310.py` for the live test suite as gates land.
