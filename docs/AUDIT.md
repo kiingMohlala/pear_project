@@ -90,10 +90,28 @@ not just "code written."
   concurrent-request safety needed no fix — the check-then-create was
   already fully inside the lock — verified explicitly with a 20-thread
   test rather than assumed.
-- 🟡 Gate 7 — Persistence/recovery audit. Not started as its own pass, but
-  now has two concrete items queued: WorkerManager's missing persistence
-  (above), and the broad `except: pass` patterns on auth/session file loads
-  noted in the original architecture audit.
+- 🟢 **Gate 7 — Persistence/recovery audit.** Fixed in `e7080fb`. Same two
+  bugs repeated across auth users.json, auth sessions.json, connector
+  credentials.enc, goal files, and workflow definition/run files:
+  non-atomic writes (plain write_text/write_bytes truncates before
+  writing — a crash mid-write corrupts the file) and silent corruption
+  swallowing (a bare `except: pass` that can't tell "no file yet" apart
+  from "file exists but is corrupted" — for the auth database, that's a
+  silent total lockout with zero error anywhere). Added
+  `atomic_write_text/bytes` (temp file + fsync + `os.replace()`) and
+  `safe_load_text/bytes` + `quarantine_corrupt_file` (loud stderr
+  warning + timestamped `.corrupted-<ts>` backup, then degrade to empty
+  state rather than crash) to `core/security.py`, wired into all five.
+  JobManager's SQLite storage already handled atomicity; only added a
+  warning on a corrupted row instead of a silent skip. Caught a real bug
+  in my own first pass this way: I'd wired the quarantine into the
+  "file unreadable" path but not the "reads fine as text, fails to
+  parse as JSON" path — the actual common corruption shape — the test
+  caught it by checking for the real backup file, not just the warning
+  text. Still open, explicitly not addressed here: WorkerManager has
+  zero persistence at all (Gate 4/5 finding) — building that from
+  scratch is bigger than hardening what exists and needs its own
+  decision.
 - 🟡 Gate 8 — Concurrency testing (30 concurrent users). Not started —
   intentionally sequenced last among the gates it depends on.
 - 🟡 Gate 9 — API surface reconciliation (stdlib vs FastAPI). Not started.
