@@ -25,6 +25,18 @@ from http.server import ThreadingHTTPServer
 from core.llm import EchoLLM
 
 
+class _RoomyThreadingHTTPServer(ThreadingHTTPServer):
+    # Default TCP accept backlog is 5 (socketserver.TCPServer default) —
+    # far too small once tests start opening dozens of near-simultaneous
+    # connections (Gate 8's 30-user test in particular). Must be a class
+    # attribute, not set on the instance after construction — listen() is
+    # called during __init__/server_activate(), before an instance
+    # attribute assignment would ever take effect. Too small a backlog
+    # causes urllib to see ECONNRESET, which looks like a server bug but
+    # is purely a test-harness capacity limit.
+    request_queue_size = 256
+
+
 def _start_server(data_root: Path):
     service = PearService(data_root=data_root)
     service.sessions.llm = EchoLLM()
@@ -33,7 +45,7 @@ def _start_server(data_root: Path):
     # as a test failure under heavy parallel test-suite load.
     service.rate_limiter.configure(per_minute=6000, burst=500)
     handler = make_handler(service)
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    httpd = _RoomyThreadingHTTPServer(("127.0.0.1", 0), handler)
     port = httpd.server_address[1]
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -962,6 +974,134 @@ def test_gate7_full_create_run_crash_restart_recover_flow():
         assert recovered_goal.user_id == "dana"
 
 
+# ── Gate 8: adversarial concurrency testing ────────────────────────────
+
+def test_gate8_adversarial_30_concurrent_users():
+    """
+    The gate's own minimum scenario: 30 concurrent users, each doing
+    chat (tracer), goal creation (ownership/IDOR), connector credentials
+    (isolation), and worker dispatch (identity propagation) at the same
+    time, over a real ThreadingHTTPServer — not mocked, not sequential.
+
+    This is deliberately not just "run the Gate 1-7 tests again" — it
+    runs all of those properties simultaneously, from the same 30 threads,
+    which can expose interaction effects an isolated per-gate test
+    wouldn't: e.g. a race between the tracer context and credential
+    lookup happening in the same request, not two separate test runs.
+    """
+    from service.auth import Role
+
+    N = 30
+    with tempfile.TemporaryDirectory() as td:
+        service, httpd, port = _start_server(Path(td))
+        service.rate_limiter.configure(per_minute=20000, burst=2000)
+
+        usernames = [f"stress{i}" for i in range(N)]
+        for u in usernames:
+            service.auth.create_user(u, f"{u}-pw", Role.USER)
+
+        errors = []
+        results = {}  # username -> dict of what we recorded for it
+        results_lock = threading.Lock()
+
+        def user_workload(username):
+            try:
+                token = _login(port, username, f"{username}-pw")
+                marker = f"MARKER_{username}_{threading.get_ident()}"
+
+                # chat / tracer
+                for i in range(4):
+                    _chat(port, token, f"{marker} chat {i}")
+
+                # goal creation (ownership + IDOR surface)
+                status, body = _goal_create(port, token, f"{marker} goal")
+                if status != 200:
+                    raise AssertionError(f"goal create failed: {status} {body}")
+                goal_id = body["goal"]["id"]
+                goal_owner = body["goal"]["user_id"]
+
+                # connector credentials (isolation) — direct orchestrator
+                # access, since there's no HTTP route for this yet
+                sess = service.sessions.get(username)
+                orch = sess.orchestrator
+                secret = f"{marker}-cred-secret"
+                orch.connectors.credentials.set("slack", {"token": secret})
+                got_secret = orch.connectors.credentials.get("slack")["token"]
+
+                # worker dispatch (identity propagation)
+                rec = orch.workers.dispatch(
+                    f"{marker} dispatch",
+                    execute_fn=lambda obj: {"ok": True, "reply": obj},
+                )
+                orch.workers.wait(rec.id, timeout=5)
+
+                # traces (cross-user leak surface)
+                status, trace_body = _get(port, token, "/v1/traces")
+                traces_dump = json.dumps(trace_body)
+
+                with results_lock:
+                    results[username] = {
+                        "marker": marker,
+                        "goal_id": goal_id,
+                        "goal_owner": goal_owner,
+                        "cred_secret_expected": secret,
+                        "cred_secret_got": got_secret,
+                        "dispatch_session_user": rec.session_user,
+                        "traces_dump": traces_dump,
+                        "orch_id": id(orch),
+                    }
+            except Exception as e:
+                with results_lock:
+                    errors.append(f"{username}: {type(e).__name__}: {e}")
+
+        threads = [threading.Thread(target=user_workload, args=(u,)) for u in usernames]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        try:
+            assert not errors, f"{len(errors)} user workload(s) raised:\n" + "\n".join(errors)
+            assert len(results) == N, f"expected {N} completed workloads, got {len(results)}"
+
+            # no incorrect ownership
+            for u, r in results.items():
+                assert r["goal_owner"] == u, f"{u}: goal owned by {r['goal_owner']!r} instead"
+                assert r["dispatch_session_user"] == u, f"{u}: dispatch owned by {r['dispatch_session_user']!r} instead"
+
+            # no cross-user credentials
+            for u, r in results.items():
+                assert r["cred_secret_got"] == r["cred_secret_expected"], \
+                    f"{u}: credential mismatch — got {r['cred_secret_got']!r}, expected {r['cred_secret_expected']!r}"
+
+            # no duplicate/conflicting sessions — re-fetching each user's
+            # session now must return the exact same orchestrator the
+            # workload thread used
+            for u, r in results.items():
+                current = service.sessions.get(u).orchestrator
+                assert id(current) == r["orch_id"], f"{u}: session orchestrator changed — duplicate/conflicting session"
+
+            # no cross-user data / no race-induced state leakage: no
+            # user's own marker may EVER appear in another user's traces
+            # or goal id.
+            all_markers = {u: r["marker"] for u, r in results.items()}
+            for u, r in results.items():
+                for other_u, other_marker in all_markers.items():
+                    if other_u == u:
+                        continue
+                    assert other_marker not in r["traces_dump"], \
+                        f"CROSS-USER LEAK: {u}'s traces contain {other_u}'s marker"
+
+            # no worker identity substitution: every dispatch's
+            # session_user matched its own username, and no OTHER
+            # username slipped in (redundant with the ownership check
+            # above, asserted separately to name this property explicitly)
+            all_session_users = {r["dispatch_session_user"] for r in results.values()}
+            assert all_session_users == set(usernames), "worker dispatch identities do not match the 30 users 1:1"
+        finally:
+            httpd.shutdown()
+
+
 if __name__ == "__main__":
     test_gate1_concurrent_traces_no_cross_user_leak()
     print("  ✓ gate1 concurrent traces — no cross-user leak")
@@ -1017,4 +1157,6 @@ if __name__ == "__main__":
     print("  ✓ gate7 auth database corruption handled loudly, not silently")
     test_gate7_full_create_run_crash_restart_recover_flow()
     print("  ✓ gate7 full create/run/crash/restart/recover flow")
+    test_gate8_adversarial_30_concurrent_users()
+    print("  ✓ gate8 adversarial 30 concurrent users")
     print("All PEAR 3.1 security tests passed (gates implemented so far).")
