@@ -1102,6 +1102,138 @@ def test_gate8_adversarial_30_concurrent_users():
             httpd.shutdown()
 
 
+# ── Gate 9: API surface reconciliation ─────────────────────────────────
+
+def _require_fastapi():
+    """Explicit SKIP, not a silent no-op pass, when FastAPI isn't
+    installed — a 'passed' test that verified nothing is worse than an
+    honestly-reported skip. requirements.txt lists fastapi/uvicorn as
+    commented-out/optional; that's a deliberate choice for anyone
+    running just the stdlib surface, but it means these tests need
+    pytest to know they didn't run, not pretend they did."""
+    import pytest
+    pytest.importorskip("fastapi")
+
+
+def test_gate9_fastapi_login_now_rate_limits_and_audits():
+    """Before Gate 9, FastAPI's /auth/login had no rate limiting and no
+    audit log entry at all — a silent divergence from the stdlib surface
+    that shares the exact same AuthManager/RateLimiter/AuditLog."""
+    _require_fastapi()
+    from service.app import create_app
+    from fastapi.testclient import TestClient
+
+    with tempfile.TemporaryDirectory() as td:
+        app = create_app(data_root=Path(td))
+        service = app.state.service
+        service.rate_limiter.configure(per_minute=60, burst=2)
+        client = TestClient(app)
+
+        codes = []
+        for _ in range(5):
+            r = client.post("/auth/login", json={"username": "rl_test_user", "password": "x"})
+            codes.append(r.status_code)
+        assert 429 in codes, "FastAPI login should be rate-limited exactly like stdlib login"
+
+        login_entries = [e for e in service.audit.recent(50) if e.get("action") == "login"]
+        assert len(login_entries) >= 5, "FastAPI login attempts should be audit-logged exactly like stdlib"
+
+
+def test_gate9_fastapi_chat_now_feeds_learning():
+    """Before Gate 9, FastAPI's /v1/chat never called
+    learning.observe_route() — /v1/recommendations would silently starve
+    forever under a FastAPI-only deployment."""
+    _require_fastapi()
+    from service.app import create_app
+    from fastapi.testclient import TestClient
+
+    with tempfile.TemporaryDirectory() as td:
+        app = create_app(data_root=Path(td))
+        service = app.state.service
+        client = TestClient(app)
+
+        r = client.post("/auth/login", json={"username": "demo", "password": "demo"})
+        token = r.json()["token"]
+        orch = service.sessions.get("demo").orchestrator
+
+        assert dict(orch.learning.routing_stats) == {}
+        for i in range(3):
+            client.post("/v1/chat", json={"message": f"hi {i}"}, headers={"Authorization": f"Bearer {token}"})
+        assert orch.learning.routing_stats.get("personal", {}).get("n", 0) == 3
+
+
+def test_gate9_stdlib_chat_stream_calls_route_exactly_once():
+    """Before Gate 9, stdlib's /v1/chat/stream called orch.route() TWICE
+    per request (leftover draft code never cleaned up) — since route()
+    creates a Task and emits events per call, every streamed chat
+    request was silently doing that work twice."""
+    with tempfile.TemporaryDirectory() as td:
+        service, httpd, port = _start_server(Path(td))
+        try:
+            token = _login(port, "demo", "demo")
+            orch = service.sessions.get("demo").orchestrator
+            tasks_before = len(orch.task_log)
+
+            req = Request(
+                f"http://127.0.0.1:{port}/v1/chat/stream",
+                data=json.dumps({"message": "hello"}).encode(),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+                method="POST",
+            )
+            with urlopen(req, timeout=10) as resp:
+                json.loads(resp.read().decode())
+
+            tasks_after = len(orch.task_log)
+            assert tasks_after - tasks_before == 1, (
+                f"expected exactly 1 new task from one /v1/chat/stream call, got {tasks_after - tasks_before} "
+                f"— route() is being called more than once per request"
+            )
+        finally:
+            httpd.shutdown()
+
+
+def test_gate9_login_parity_between_surfaces():
+    """The same credentials against both surfaces must produce
+    equivalent outcomes — both success and failure shapes."""
+    _require_fastapi()
+    from service.app import create_app
+    from fastapi.testclient import TestClient
+
+    with tempfile.TemporaryDirectory() as td1, tempfile.TemporaryDirectory() as td2:
+        # stdlib
+        service1, httpd1, port1 = _start_server(Path(td1))
+        try:
+            std_status, std_body = _post(port1, None, "/auth/login", {"username": "demo", "password": "wrong"})
+        finally:
+            httpd1.shutdown()
+
+        # FastAPI, same scenario
+        app = create_app(data_root=Path(td2))
+        client = TestClient(app)
+        fa_resp = client.post("/auth/login", json={"username": "demo", "password": "wrong"})
+
+        assert std_status == 401
+        assert fa_resp.status_code == 401
+        assert std_body["ok"] is False
+        assert fa_resp.json()["detail"]["ok"] is False
+        assert std_body["error"] == fa_resp.json()["detail"]["error"]
+
+
+def test_gate9_no_duplicate_dead_route_handlers():
+    """Regression lock for the dead/duplicate beta route handlers found
+    while building the Gate 9 parity matrix — a second, pre-Gate-2-
+    vulnerable copy of /v1/beta/activate and /v1/beta/status sat later
+    in _dispatch(), unreachable only because an earlier block always
+    matched first. Reads the actual source rather than just testing
+    behavior, since the whole point is that dead code doesn't execute —
+    a behavioral test alone wouldn't have caught it existing at all."""
+    import inspect
+    from service.app import PearService
+    src = inspect.getsource(PearService._dispatch)
+    assert src.count('path == "/v1/beta/activate"') == 1
+    assert src.count('path == "/v1/beta/status"') == 1
+
+
 if __name__ == "__main__":
     test_gate1_concurrent_traces_no_cross_user_leak()
     print("  ✓ gate1 concurrent traces — no cross-user leak")
@@ -1159,4 +1291,14 @@ if __name__ == "__main__":
     print("  ✓ gate7 full create/run/crash/restart/recover flow")
     test_gate8_adversarial_30_concurrent_users()
     print("  ✓ gate8 adversarial 30 concurrent users")
+    test_gate9_fastapi_login_now_rate_limits_and_audits()
+    print("  ✓ gate9 FastAPI login now rate-limits and audits")
+    test_gate9_fastapi_chat_now_feeds_learning()
+    print("  ✓ gate9 FastAPI chat now feeds learning")
+    test_gate9_stdlib_chat_stream_calls_route_exactly_once()
+    print("  ✓ gate9 stdlib chat/stream calls route() exactly once")
+    test_gate9_login_parity_between_surfaces()
+    print("  ✓ gate9 login parity between surfaces")
+    test_gate9_no_duplicate_dead_route_handlers()
+    print("  ✓ gate9 no duplicate dead route handlers")
     print("All PEAR 3.1 security tests passed (gates implemented so far).")

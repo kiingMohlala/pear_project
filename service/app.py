@@ -101,6 +101,59 @@ class PearService:
             self.metrics["errors"] += 1
             return 500, {"ok": False, "error": str(e), "trace": traceback.format_exc()[-500:]}
 
+    # ── Shared business logic (PEAR 3.1 Gate 9) ─────────────────────
+    #
+    # do_login/do_logout/do_chat live here specifically so BOTH HTTP
+    # surfaces (the stdlib _dispatch() below, and create_app()'s FastAPI
+    # routes further down this file) call the exact same code, not two
+    # separate implementations that can quietly drift apart. Building the
+    # API parity matrix for this gate found three real cases where they
+    # already had: FastAPI's login had no rate limiting and no audit log
+    # entry at all (any outcome — success, failure, lockout); logout had
+    # no audit log entry; and chat never called learning.observe_route(),
+    # meaning /v1/recommendations would silently starve forever under a
+    # FastAPI-only deployment since nothing ever fed it a training
+    # signal. None of these were deliberate — they're exactly the kind of
+    # accidental divergence two independently-hand-written HTTP layers
+    # produce over time. See docs/API_PARITY.md for the full route-by-
+    # route comparison.
+
+    def do_login(self, username: str, password: str) -> tuple:
+        ok_rl, info = self.rate_limiter.allow(f"auth:{username or 'anon'}")
+        if not ok_rl:
+            self.audit.record("login", actor=username, outcome="rate_limited", detail=info)
+            return 429, {"ok": False, "error": "too many login attempts", **info}
+        status = self.auth.login_status(username)
+        if status.get("locked"):
+            self.audit.record("login", actor=username, outcome="locked", detail=status)
+            return 423, {"ok": False, "error": "account temporarily locked", "retry_after_s": status.get("retry_after_s", 0)}
+        user = self.auth.login(username, password)
+        if not user:
+            self.audit.record("login", actor=username, outcome="fail")
+            st = self.auth.login_status(username)
+            return 401, {"ok": False, "error": "invalid credentials", "locked": st.get("locked"), "retry_after_s": st.get("retry_after_s", 0)}
+        self.audit.record("login", actor=user.username, outcome="ok")
+        return 200, {"ok": True, "token": user.token, "user": user.to_public(), "expires_hint_s": getattr(self.auth, "token_ttl_s", 43200)}
+
+    def do_logout(self, user, token: str) -> tuple:
+        self.auth.require(user, Role.USER, Role.ADMIN, Role.API_CLIENT)
+        self.auth.revoke_token(token)
+        self.audit.record("logout", actor=user.username, outcome="ok")
+        return 200, {"ok": True}
+
+    def do_chat(self, orch, message: str, on_token=None) -> Dict[str, Any]:
+        self.metrics["routes"] += 1
+        result = orch.route(message, on_token=on_token)
+        try:
+            orch.learning.observe_route(
+                result.get("agent") or "unknown",
+                bool(result.get("ok")),
+                objective=message,
+            )
+        except Exception:
+            pass
+        return result
+
     def _dispatch(self, method: str, path: str, headers: Dict[str, str], body: bytes) -> tuple:
         parsed = urlparse(path)
         path = parsed.path.rstrip("/") or "/"
@@ -127,30 +180,13 @@ class PearService:
 
         if path == "/auth/login" and method == "POST":
             username = str(data.get("username") or "")
-            ok_rl, info = self.rate_limiter.allow(f"auth:{username or 'anon'}")
-            if not ok_rl:
-                self.audit.record("login", actor=username, outcome="rate_limited", detail=info)
-                return 429, {"ok": False, "error": "too many login attempts", **info}
-            status = self.auth.login_status(username)
-            if status.get("locked"):
-                self.audit.record("login", actor=username, outcome="locked", detail=status)
-                return 423, {"ok": False, "error": "account temporarily locked", "retry_after_s": status.get("retry_after_s", 0)}
-            user = self.auth.login(username, data.get("password") or "")
-            if not user:
-                self.audit.record("login", actor=username, outcome="fail")
-                st = self.auth.login_status(username)
-                return 401, {"ok": False, "error": "invalid credentials", "locked": st.get("locked"), "retry_after_s": st.get("retry_after_s", 0)}
-            self.audit.record("login", actor=user.username, outcome="ok")
-            return 200, {"ok": True, "token": user.token, "user": user.to_public(), "expires_hint_s": getattr(self.auth, "token_ttl_s", 43200)}
+            return self.do_login(username, data.get("password") or "")
 
         if path == "/auth/logout" and method == "POST":
             # resolve user from header before require (user may not be set yet in this branch)
             user = self.user_from_headers(headers)
-            self.auth.require(user, Role.USER, Role.ADMIN, Role.API_CLIENT)
             tok = headers.get("Authorization") or headers.get("authorization") or ""
-            self.auth.revoke_token(tok)
-            self.audit.record("logout", actor=user.username, outcome="ok")
-            return 200, {"ok": True}
+            return self.do_logout(user, tok)
 
 
         # dashboard static
@@ -275,36 +311,38 @@ class PearService:
 
         if path == "/v1/chat" and method == "POST":
             message = data.get("message") or data.get("text") or ""
-            self.metrics["routes"] += 1
-            result = orch.route(message)
-            # learning observe
-            try:
-                orch.learning.observe_route(
-                    result.get("agent") or "unknown",
-                    bool(result.get("ok")),
-                    objective=message,
-                )
-            except Exception:
-                pass
+            result = self.do_chat(orch, message)
             return 200, {"ok": True, "result": result}
 
         if path == "/v1/chat/stream" and method == "POST":
-            # stdlib fallback: return full response with streamed flag simulation
+            # stdlib fallback: http.server has no native streaming-response
+            # story the way an ASGI app does, so this simulates it by
+            # collecting on_token chunks and returning them as a list
+            # alongside the final result, rather than true SSE. That's an
+            # intentional, documented capability difference from FastAPI's
+            # StreamingResponse version — see docs/API_PARITY.md — not
+            # something to "fix" here.
+            #
+            # PEAR 3.1 Gate 9: this used to call orch.route() TWICE per
+            # request (a leftover from an earlier draft that was never
+            # cleaned up) — once to probe whether on_token was supported,
+            # then unconditionally again, discarding the first call's
+            # result. Since route() creates a Task and emits events per
+            # call, every /v1/chat/stream request was silently doing that
+            # work twice. Fixed to call it exactly once via do_chat().
             message = data.get("message") or ""
             chunks = []
-            result = orch.route(message, on_token=chunks.append) if "on_token" in getattr(orch.route, "__code__", type("", (), {"co_varnames": ()})).co_varnames else orch.route(message)
-            # try streaming signature
-            try:
-                chunks = []
-                result = orch.route(message, on_token=chunks.append)
-            except TypeError:
-                result = orch.route(message)
-                chunks = list(result.get("reply") or "")
+            result = self.do_chat(orch, message, on_token=chunks.append)
+            if not chunks:
+                # agent didn't support/use streaming for this reply — fall
+                # back to chunking the final text so the response shape
+                # stays consistent either way.
+                chunks = [result.get("reply", "")[i:i+32] for i in range(0, len(result.get("reply", "")), 32)]
             return 200, {
                 "ok": True,
                 "result": result,
-                "chunks": chunks if isinstance(chunks, list) else [],
-                "streamed": True,
+                "chunks": chunks,
+                "streamed": bool(chunks and chunks != [result.get("reply", "")]),
             }
 
         if path == "/v1/agents" and method == "GET":
@@ -409,41 +447,14 @@ class PearService:
 
 
         # ── beta program ──────────────────────────────────────────
-        if path == "/v1/beta/activate" and method == "POST":
-            _b = self._require_beta()
-            if _b:
-                return _b
-            account = data.get("account") or (user.username if user else "")
-            if not account:
-                return 400, {"ok": False, "error": "account required"}
-            result = self.beta.activate(
-                data.get("code") or "",
-                account=account,
-                device_id=str(data.get("device_id") or "unknown"),
-                platform=str(data.get("platform") or "mobile"),
-                app_version=str(data.get("app_version") or "3.0.0"),
-            )
-            self.audit.record(
-                "beta_activate",
-                actor=account,
-                outcome="ok" if result.get("ok") else "fail",
-                detail={"code_prefix": str(data.get("code") or "")[:9]},
-            )
-            return (200 if result.get("ok") else 400), result
-
-        if path == "/v1/beta/status" and method == "POST":
-            _b = self._require_beta()
-            if _b:
-                return _b
-            account = data.get("account") or (user.username if user else "")
-            result = self.beta.check_access(
-                account or "",
-                str(data.get("device_id") or ""),
-                platform=str(data.get("platform") or ""),
-                app_version=str(data.get("app_version") or ""),
-            )
-            return 200, result
-
+        # (activate/status handled earlier, before the auth gate — see
+        # the PEAR 3.1 Gate 2 block above. A second, pre-Gate-2 copy of
+        # both used to sit here as dead code — unreachable only because
+        # the earlier block always matched first, but a real landmine:
+        # any future reordering of these blocks would have silently
+        # reintroduced the exact account-override vulnerability Gate 2
+        # fixed, with no warning, since it still looked like valid code.
+        # Removed during Gate 9's duplicate/divergence cleanup.
         if path == "/v1/beta/consent" and method == "POST":
             _b = self._require_beta()
             if _b:
@@ -620,19 +631,16 @@ def create_app(data_root: Optional[Path] = None):
     @app.post("/auth/login")
     def login(payload: dict):
         username = str(payload.get("username") or "")
-        st = service.auth.login_status(username)
-        if st.get("locked"):
-            raise HTTPException(423, "account temporarily locked")
-        user = service.auth.login(username, payload.get("password") or "")
-        if not user:
-            raise HTTPException(401, "invalid credentials")
-        return {"ok": True, "token": user.token, "user": user.to_public()}
+        status_code, body = service.do_login(username, payload.get("password") or "")
+        if status_code != 200:
+            raise HTTPException(status_code, detail=body)
+        return body
 
     @app.post("/auth/logout")
     def logout(authorization: Optional[str] = Header(None)):
         user = user_dep(authorization)
-        service.auth.revoke_token(authorization or "")
-        return {"ok": True}
+        status_code, body = service.do_logout(user, authorization or "")
+        return body
 
     @app.get("/", response_class=HTMLResponse)
     @app.get("/dashboard", response_class=HTMLResponse)
@@ -643,7 +651,7 @@ def create_app(data_root: Optional[Path] = None):
     def chat(payload: dict, authorization: Optional[str] = Header(None)):
         user = user_dep(authorization)
         orch = service.sessions.get(user.username).orchestrator
-        result = orch.route(payload.get("message") or "")
+        result = service.do_chat(orch, payload.get("message") or "")
         return {"ok": True, "result": result}
 
     @app.post("/v1/chat/stream")
@@ -654,13 +662,8 @@ def create_app(data_root: Optional[Path] = None):
 
         def gen():
             chunks = []
-            try:
-                result = orch.route(message, on_token=lambda t: chunks.append(t) or None)
-            except TypeError:
-                result = orch.route(message)
-            # emit chunks then final
+            result = service.do_chat(orch, message, on_token=lambda t: chunks.append(t))
             text = result.get("reply") or ""
-            # if no token callback captured, chunk the reply
             parts = chunks or [text[i:i+32] for i in range(0, len(text), 32)]
             for p in parts:
                 yield f"data: {json.dumps({'token': p})}\n\n"
