@@ -2,6 +2,19 @@
 
 ## PEAR 3.1 — Ownership, Isolation & Concurrency Hardening
 
+**Status: all 9 gates complete as of `b936b1d`.**
+
+Recommended next step, not yet done: freeze this state as PEAR 3.1 and
+re-run the full architecture audit from scratch (the same audit that
+started this pass) against the frozen tree, rather than taking this
+hardening effort's own word for its results. The original audit's
+findings — cross-user tracer leak, dead `authorize_resource()`, shared
+credential store, implicit ownership, worker identity drop, unbounded
+sessions, silent persistence corruption, no concurrency testing,
+divergent HTTP surfaces — should now resolve to 0 unresolved P0/P1s per
+the task card's own required result definition. That re-audit is what
+actually confirms it.
+
 Status of the 9-gate task card. Each gate is only marked done once it has
 a real test that (a) fails against the pre-fix code via `git stash` and
 (b) passes against the fix, run stable across repeated full-suite runs —
@@ -127,7 +140,26 @@ not just "code written."
   256, set as a class attribute since `listen()` runs during
   `__init__` — an instance-attribute assignment after construction is
   too late), confirmed with 8 consecutive clean runs before trusting it.
-- 🟡 Gate 9 — API surface reconciliation (stdlib vs FastAPI). Not started.
+- 🟢 **Gate 9 — API surface reconciliation (stdlib vs FastAPI).** Fixed in
+  `b936b1d`. Declared stdlib `_dispatch()` canonical, FastAPI a secondary
+  compatibility surface — not migrating during a hardening gate. Built
+  the real parity matrix (`docs/API_PARITY.md`): ~11 overlapping routes,
+  ~28 stdlib-only routes explicitly not duplicated into FastAPI. Found 3
+  real silent divergences on the overlap — FastAPI's login had no rate
+  limiting or audit logging at all, logout had no audit logging, chat
+  never fed `learning.observe_route()` (silently starving
+  `/v1/recommendations` under a FastAPI-only deployment). Fixed by
+  extracting shared `PearService.do_login()/do_logout()/do_chat()`,
+  called by both surfaces, not just patching FastAPI to match. Also
+  found and fixed independently: stdlib's `/v1/chat/stream` was calling
+  `orch.route()` twice per request (dead leftover code, duplicating task
+  creation on every streamed chat); and a second, pre-Gate-2-vulnerable
+  copy of the beta activate/status routes sitting later in `_dispatch()`
+  as a landmine — unreachable today only because the earlier fixed copy
+  always matched first. Neither FastAPI nor uvicorn were installed
+  anywhere in this environment before this gate — installed both and
+  verified every fix against a real `TestClient`, not just by reading
+  code. All 9 gates of PEAR 3.1 are now complete.
 
 See `tests/test_security_v310.py` for the live test suite as gates land.
 
