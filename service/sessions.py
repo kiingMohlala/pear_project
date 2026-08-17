@@ -76,7 +76,16 @@ class SessionManager:
             ReviewerAgent, CriticAgent,
         ):
             try:
-                if cls in (DesktopAgent, BrowserAgent, ComputerUseAgent):
+                if cls is BrowserAgent:
+                    # PEAR 3.1 Gate 10: explicit injection of this
+                    # orchestrator's own BrowserManager — the actual fix.
+                    # Without this, BrowserAgent would fall back to
+                    # constructing its own private manager, which is safe
+                    # but pointless: orch.browser_manager would sit there
+                    # unused while every action actually ran through a
+                    # different, second manager instance.
+                    orch.register(cls(browser_manager=orch.browser_manager))
+                elif cls in (DesktopAgent, ComputerUseAgent):
                     orch.register(cls())
                 else:
                     orch.register(cls(llm=llm))
@@ -130,14 +139,20 @@ class SessionManager:
         are plain files with no held-open connection to close; Tracer
         opens a fresh sqlite3 connection per write rather than holding
         one, so nothing to close there either. What DOES need explicit
-        shutdown: JobManager's persistent worker threads, and
-        WorkerManager's ThreadPoolExecutor."""
+        shutdown: JobManager's persistent worker threads,
+        WorkerManager's ThreadPoolExecutor, and (PEAR 3.1 Gate 10) this
+        user's BrowserManager — closing its Playwright browser/context/
+        page so no orphan browser process survives the session."""
         try:
             orch.jobs.stop(timeout=2.0)
         except Exception:
             pass
         try:
             orch.workers.shutdown()
+        except Exception:
+            pass
+        try:
+            orch.browser_manager.close()
         except Exception:
             pass
 

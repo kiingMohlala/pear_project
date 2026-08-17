@@ -1234,6 +1234,214 @@ def test_gate9_no_duplicate_dead_route_handlers():
     assert src.count('path == "/v1/beta/status"') == 1
 
 
+# ── Gate 10: browser session ownership & isolation ─────────────────────
+#
+# Environment note, honestly documented rather than worked around: this
+# sandbox's network egress allowlist does not include cdn.playwright.dev,
+# so `playwright install chromium` cannot download a real browser binary
+# here (confirmed: pip install playwright succeeds, the binary download
+# fails with an explicit host-not-allowlisted error). Tests below prove
+# isolation at the BrowserManager/BrowserSession object level and at the
+# session-state level (current_url, history, downloads, title) — the same
+# level the original vulnerability was actually found and reproduced at
+# (`alice_browser_agent.browser is bob_browser_agent.browser`). Where the
+# task card calls for cookie/localStorage/page isolation specifically,
+# that reduces to: are Alice's and Bob's BrowserSession objects the same
+# Python object or different ones? If different, no mechanism exists for
+# one's Playwright context (when a real browser IS available) to be
+# visible to the other, since each BrowserManager owns its own
+# session._browser/_context/_page exclusively. This is the "lowest
+# browser-layer resource that still proves the ownership boundary" the
+# task explicitly permits substituting when full browser launches aren't
+# feasible in the test environment.
+
+def test_gate10_a_manager_isolation():
+    """A. Two independent users must never receive the same BrowserManager."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice = sm.get("alice").orchestrator
+        bob = sm.get("bob").orchestrator
+        assert alice.browser_manager is not bob.browser_manager
+        alice_ba = alice.agents.get("browser")
+        bob_ba = bob.agents.get("browser")
+        assert alice_ba is not None and bob_ba is not None
+        assert alice_ba.browser is not bob_ba.browser
+        # and each agent's .browser is genuinely its OWN orchestrator's
+        # manager, not some third unrelated one
+        assert alice_ba.browser is alice.browser_manager
+        assert bob_ba.browser is bob.browser_manager
+
+
+def test_gate10_b_context_isolation():
+    """B. Underlying browser sessions (the object that would own the
+    Playwright context/page when a real browser is available) are
+    distinct objects, not shared state."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice_ba = sm.get("alice").orchestrator.agents.get("browser")
+        bob_ba = sm.get("bob").orchestrator.agents.get("browser")
+        assert alice_ba.browser.session is not bob_ba.browser.session
+        assert id(alice_ba.browser.session) != id(bob_ba.browser.session)
+
+
+def test_gate10_cde_cookie_storage_page_isolation_simulated():
+    """C/D/E. Cookie/storage/page isolation, tested at the session-state
+    level available in this sandbox (see module note above). Writes
+    distinctive per-user state into Alice's session and confirms Bob's
+    session — reached only through Bob's own BrowserAgent — never
+    reflects it."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice_ba = sm.get("alice").orchestrator.agents.get("browser")
+        bob_ba = sm.get("bob").orchestrator.agents.get("browser")
+
+        # simulate a page/navigation state + a "storage-like" value
+        # (downloads list stands in for storage: real per-session mutable
+        # state that a shared object WOULD leak, same category of bug as
+        # cookies/localStorage)
+        alice_ba.browser.session.current_url = "https://alice-secret-site.example/dashboard"
+        alice_ba.browser.session.title = "Alice's private dashboard"
+        alice_ba.browser.session.history.append("https://alice-secret-site.example/dashboard")
+        alice_ba.browser.session.downloads.append({"filename": "alice_secret.pdf", "path": "/tmp/alice_secret.pdf"})
+
+        # Bob's browser, reached only through Bob's own agent, must show
+        # none of it — his session starts fresh/empty.
+        assert bob_ba.browser.session.current_url != alice_ba.browser.session.current_url
+        assert "alice" not in (bob_ba.browser.session.title or "").lower()
+        assert "alice-secret-site" not in " ".join(bob_ba.browser.session.history)
+        assert not any("alice_secret" in str(d) for d in bob_ba.browser.session.downloads)
+
+
+def test_gate10_f_authentication_state_isolation_simulated():
+    """F. No real third-party credentials used — a synthetic
+    "authenticated state" marker in Alice's session must not be visible
+    through Bob's browser agent."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice_ba = sm.get("alice").orchestrator.agents.get("browser")
+        bob_ba = sm.get("bob").orchestrator.agents.get("browser")
+
+        # Synthetic marker standing in for "logged in as Alice" state —
+        # not a real credential, just a distinguishable fingerprint of
+        # per-session authenticated state.
+        alice_ba.browser.session.history.append("SYNTHETIC_AUTH_TOKEN_alice_9f3a7b")
+        assert "SYNTHETIC_AUTH_TOKEN_alice_9f3a7b" not in " ".join(bob_ba.browser.session.history)
+
+
+def test_gate10_g_session_eviction_closes_browser_resources():
+    """G. Evicting a session must actually release its browser resources
+    — not just drop the dict entry."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        orch = sm.get("carol").orchestrator
+        bm = orch.browser_manager
+
+        # simulate a "started" browser without needing a real Chromium
+        # binary, so close() has something real to release
+        bm._started = True
+        bm.session._page = object()
+        fake_browser = _FakeCloseable()
+        fake_playwright = _FakeStoppable()
+        bm.session._browser = fake_browser
+        bm.session._playwright = fake_playwright
+
+        assert sm.evict("carol") is True
+        assert bm._started is False
+        assert bm.session._page is None
+        assert bm.session._browser is None
+        assert bm.session._playwright is None
+        assert fake_browser.closed is True, "browser.close() was not actually called during eviction"
+        assert fake_playwright.stopped is True, "playwright.stop() was not actually called during eviction"
+
+
+class _FakeCloseable:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeStoppable:
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_gate10_h_restart_isolation():
+    """H. Closing/restarting Alice's browser must not affect Bob's."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice_ba = sm.get("alice").orchestrator.agents.get("browser")
+        bob_ba = sm.get("bob").orchestrator.agents.get("browser")
+
+        bob_ba.browser.session.current_url = "https://bob-site.example"
+        bob_ba.browser._started = True
+
+        alice_ba.browser.close()  # "restart" alice's browser
+
+        assert alice_ba.browser._started is False
+        assert bob_ba.browser._started is True, "closing alice's browser affected bob's"
+        assert bob_ba.browser.session.current_url == "https://bob-site.example"
+
+
+def test_gate10_i_concurrent_30_users_no_shared_browser_state():
+    """I. 30 concurrent users/sessions, browser agents initialized for
+    each. Real Chromium launches aren't feasible in this sandbox (see
+    module note) — proves the ownership boundary at the BrowserManager/
+    session object-identity level instead, which is exactly what the
+    original vulnerability was reproduced at and is what determines
+    whether real cookies/contexts (when available) could ever cross."""
+    from service.sessions import SessionManager
+    N = 30
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        usernames = [f"bstress{i}" for i in range(N)]
+        managers = {}
+        sessions = {}
+        errors = []
+        lock = threading.Lock()
+
+        def worker(u):
+            try:
+                orch = sm.get(u).orchestrator
+                ba = orch.agents.get("browser")
+                if ba is None:
+                    raise AssertionError(f"{u}: no browser agent registered")
+                ba.browser.session.current_url = f"https://{u}-only.example"
+                with lock:
+                    managers[u] = id(ba.browser)
+                    sessions[u] = id(ba.browser.session)
+            except Exception as e:
+                with lock:
+                    errors.append(f"{u}: {e}")
+
+        threads = [threading.Thread(target=worker, args=(u,)) for u in usernames]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, f"errors during concurrent browser-agent init:\n" + "\n".join(errors)
+        assert len(managers) == N
+        assert len(set(managers.values())) == N, "duplicate BrowserManager id — two users share one manager"
+        assert len(set(sessions.values())) == N, "duplicate BrowserSession id — two users share one session"
+
+        # each user's own session still holds only its own marker
+        for u in usernames:
+            orch = sm.get(u).orchestrator
+            url = orch.agents.get("browser").browser.session.current_url
+            assert url == f"https://{u}-only.example", f"{u}: session state does not match what this user wrote"
+
+
 if __name__ == "__main__":
     test_gate1_concurrent_traces_no_cross_user_leak()
     print("  ✓ gate1 concurrent traces — no cross-user leak")
@@ -1301,4 +1509,18 @@ if __name__ == "__main__":
     print("  ✓ gate9 login parity between surfaces")
     test_gate9_no_duplicate_dead_route_handlers()
     print("  ✓ gate9 no duplicate dead route handlers")
+    test_gate10_a_manager_isolation()
+    print("  ✓ gate10a browser manager isolation")
+    test_gate10_b_context_isolation()
+    print("  ✓ gate10b browser session/context isolation")
+    test_gate10_cde_cookie_storage_page_isolation_simulated()
+    print("  ✓ gate10c-e cookie/storage/page isolation (simulated)")
+    test_gate10_f_authentication_state_isolation_simulated()
+    print("  ✓ gate10f authentication state isolation (simulated)")
+    test_gate10_g_session_eviction_closes_browser_resources()
+    print("  ✓ gate10g eviction closes browser resources")
+    test_gate10_h_restart_isolation()
+    print("  ✓ gate10h restart isolation")
+    test_gate10_i_concurrent_30_users_no_shared_browser_state()
+    print("  ✓ gate10i 30 concurrent users, no shared browser state")
     print("All PEAR 3.1 security tests passed (gates implemented so far).")

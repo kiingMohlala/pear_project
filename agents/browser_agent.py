@@ -15,14 +15,18 @@ from .base import Agent
 from core.task import Task
 from core.browser import (
     BrowserManager,
-    get_browser_manager,
     BROWSER_PERM_GROUPS,
     playwright_available,
 )
 
 
 class BrowserAgent(Agent):
-    def __init__(self, download_dir: Optional[Path] = None, **kwargs):
+    def __init__(
+        self,
+        browser_manager: Optional[BrowserManager] = None,
+        download_dir: Optional[Path] = None,
+        **kwargs,
+    ):
         super().__init__(
             name="browser",
             description=(
@@ -49,10 +53,21 @@ class BrowserAgent(Agent):
             system_prompt="You are PEAR's Browser Agent. Prefer read-only browsing; ask approval for forms/logins/uploads.",
             **kwargs,
         )
-        # downloads under workspace
-        if download_dir is None:
-            download_dir = Path.home() / "PEAR_Workspace" / "downloads"
-        self.browser = get_browser_manager(download_dir=download_dir)
+        # PEAR 3.1 Gate 10: ownership is explicit now, not a process-global
+        # singleton. If the caller (Orchestrator, via SessionManager) hands
+        # us a browser_manager, we use exactly that instance — this is how
+        # per-user isolation is actually enforced, one BrowserManager per
+        # Orchestrator, never shared. If nobody hands us one (bare
+        # BrowserAgent() construction — the CLI, the evaluation harness,
+        # ad-hoc scripts, tests), we build our OWN private instance here.
+        # That's still correctly isolated for those single-context callers;
+        # it's just never the same object two different BrowserAgents share.
+        if browser_manager is not None:
+            self.browser = browser_manager
+        else:
+            if download_dir is None:
+                download_dir = Path.home() / "PEAR_Workspace" / "downloads"
+            self.browser = BrowserManager(download_dir=download_dir)
         self.permissions.grant("chat")
         for group, actions in BROWSER_PERM_GROUPS.items():
             if group in ("browser_read",):

@@ -138,6 +138,23 @@ class Orchestrator:
             cred_path = _P(self.memory.persist_dir) / "credentials.enc"
             cred_store = CredentialStore(path=cred_path)
         self.connectors = build_default_connectors(workspace=ws, credential_store=cred_store)
+
+        # PEAR 3.1 Gate 10: per-user BrowserManager, same ownership pattern
+        # as tracer/jobs/credentials above. Previously agents/browser_agent.py
+        # pulled a process-global singleton (core.browser.get_browser_manager())
+        # instead of anything scoped here — every user's BrowserAgent got the
+        # literal same browser session (cookies, login state, open pages).
+        # Constructing this is cheap regardless of whether the deployment
+        # ever uses the browser agent: BrowserManager doesn't launch
+        # Playwright until ensure_browser() is actually called by a real
+        # navigation, so an unused one costs nothing but a download-dir
+        # mkdir.
+        from .browser import BrowserManager as _BrowserManager
+        browser_download_dir = None
+        if getattr(self.memory, "persist_dir", None):
+            from pathlib import Path as _P
+            browser_download_dir = _P(self.memory.persist_dir) / "browser_downloads"
+        self.browser_manager = _BrowserManager(download_dir=browser_download_dir)
         media_dir = None
         if getattr(self.memory, "persist_dir", None):
             from pathlib import Path as _P

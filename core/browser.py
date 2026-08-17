@@ -95,8 +95,14 @@ class BrowserSession:
 
 class BrowserManager:
     """
-    Manages a single shared session per process (sufficient for PEAR CLI).
-    Downloads land under workspace/downloads.
+    Owns exactly one browser session (Playwright browser/context/page when
+    available, or simulated navigation state otherwise). Does NOT manage
+    its own lifetime as a shared/global resource — PEAR 3.1 Gate 10:
+    ownership belongs to whichever Orchestrator constructs it (one per
+    authenticated user via SessionManager), or to whoever else
+    instantiates it directly (e.g. the CLI, which gets its own private
+    instance). Never share one BrowserManager across two Orchestrators.
+    Downloads land under whatever download_dir the owner passes in.
     """
 
     def __init__(self, download_dir: Optional[Path] = None, headless: bool = True):
@@ -359,14 +365,3 @@ class BrowserManager:
             "current_url": self.session.current_url,
             "downloads": list(self.session.downloads),
         }
-
-
-# process-level manager (set by BrowserAgent)
-_manager: Optional[BrowserManager] = None
-
-
-def get_browser_manager(download_dir: Optional[Path] = None) -> BrowserManager:
-    global _manager
-    if _manager is None:
-        _manager = BrowserManager(download_dir=download_dir)
-    return _manager
