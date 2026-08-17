@@ -2,23 +2,85 @@
 
 ## PEAR 3.1 — Ownership, Isolation & Concurrency Hardening
 
-**Status: all 9 gates complete as of `b936b1d`.**
+**Status: Gates 1-9 complete as of `b936b1d`; frozen and independently
+re-audited from a fresh clone (tag `pear-3.1-frozen`, commit `c5b481a`)
+without relying on Gates 1-9's own conclusions. The re-audit found one
+confirmed HIGH-severity finding the original 9 gates never touched — a
+process-global browser session singleton, `core/browser.py`'s
+`get_browser_manager()` — fixed as Gate 10 (`45ff40c`). All 10 gates now
+complete.**
 
-Recommended next step, not yet done: freeze this state as PEAR 3.1 and
-re-run the full architecture audit from scratch (the same audit that
-started this pass) against the frozen tree, rather than taking this
-hardening effort's own word for its results. The original audit's
-findings — cross-user tracer leak, dead `authorize_resource()`, shared
-credential store, implicit ownership, worker identity drop, unbounded
-sessions, silent persistence corruption, no concurrency testing,
-divergent HTTP surfaces — should now resolve to 0 unresolved P0/P1s per
-the task card's own required result definition. That re-audit is what
-actually confirms it.
+The re-audit's own words, worth keeping verbatim rather than summarizing
+away: *"the browser-session singleton is a real, high-severity,
+currently-shipping cross-user leak, found specifically by asking 'what
+other object could bypass this' rather than checking the known fix
+locations — which is exactly what you asked me to do, and exactly what a
+same-author re-audit is at risk of missing."* The re-audit also
+confirmed the browser bug **predates PEAR 3.1 entirely** — not a
+regression from Gates 1-9, and honestly noted that the original
+architecture audit (which started this whole hardening pass) missed it
+too, having flagged `BrowserAgent`'s approval-gating as a strength
+without examining the session-sharing layer underneath it.
 
-Status of the 9-gate task card. Each gate is only marked done once it has
-a real test that (a) fails against the pre-fix code via `git stash` and
-(b) passes against the fix, run stable across repeated full-suite runs —
-not just "code written."
+Two lower-severity items the re-audit surfaced and did **not** treat as
+blocking Gate 10 — logged here rather than silently dropped:
+- A narrow TOCTOU window in Gate 6's `evict()`: the busy-check and the
+  actual `del self._sessions[user_id]` are atomic under `SessionManager`'s
+  own lock, but a job can transition `QUEUED → RUNNING` under
+  `JobManager`'s separate lock in the gap between them. Mitigated by
+  `jobs.stop(timeout=2.0)` still gracefully joining a just-started worker
+  thread on shutdown; not theoretically closed for jobs that take longer
+  than 2s to begin real work. Same-user impact only, no cross-user
+  exposure.
+- `evaluation/engine.py`'s offline harness constructs bare `Orchestrator`
+  instances without a `persist_dir` in some of its own internal test
+  setup, which falls back to the pre-Gate-3 global credential path. Not
+  reachable through the live service — no attacker path — noted for
+  completeness only.
+
+Recommended next step, still not yet done: re-run the full architecture
+audit **again**, fresh, against the Gate-10-frozen state, the same way
+the Gate 10 re-audit was run against the Gate-9 state — since a same-
+author audit that already knows about Gate 10 is exactly the risk this
+whole process has been designed to catch twice now.
+
+Status of the (now 10-gate) task card. Each gate is only marked done
+once it has a real test that (a) fails against the pre-fix code via
+`git stash` and (b) passes against the fix, run stable across repeated
+full-suite runs — not just "code written."
+
+- 🟢 **Gate 10 — Browser session ownership & isolation.** Fixed in
+  `45ff40c`. Found by the independent frozen-state re-audit, not by any
+  of Gates 1-9: `core/browser.py` held a process-global `BrowserManager`
+  singleton (`get_browser_manager()`), and `BrowserAgent.__init__`
+  (`agents/browser_agent.py:55`) called it instead of receiving an
+  owned instance — every user's `BrowserAgent` got the literal same
+  Playwright session (cookies, login state, open pages). Reproduced
+  directly before any code change:
+  `alice_browser_agent.browser is bob_browser_agent.browser` → `True`.
+  Fixed with explicit ownership, no replacement global: `Orchestrator`
+  now constructs and owns `self.browser_manager` (same
+  `persist_dir`-scoped pattern as tracer/jobs/credentials —
+  `browser_downloads/` per user, previously a shared
+  `~/PEAR_Workspace/downloads` for everyone too), `SessionManager`
+  injects it into `BrowserAgent`'s constructor, and Gate 6's
+  `_shutdown_orchestrator()` now also calls
+  `orch.browser_manager.close()` on eviction. Bare `BrowserAgent()`
+  construction (the CLI, the evaluation harness — the only other two
+  call sites in the repo) still works with zero required arguments,
+  each now getting its own private, non-shared manager rather than a
+  missing global — stronger isolation than before even for those
+  callers. Real Chromium launches aren't feasible in this sandbox
+  (`cdn.playwright.dev` isn't in the network egress allowlist, confirmed
+  by attempting the actual download, not assumed) — isolation proved at
+  the `BrowserManager`/`BrowserSession` object-identity and session-state
+  level instead, the same level the vulnerability was actually found and
+  reproduced at, and the same level that determines whether real
+  cookies/contexts could ever cross when a browser binary is available.
+  7 tests covering the task's full A-I list, all 7 confirmed to fail
+  against the pre-fix singleton via `git stash` — including the 30-user
+  test, which showed the literal mechanism directly: all 30 usernames
+  collapsing to one shared object id.
 
 - 🟢 **Gate 1 — Tracer isolation.** Fixed in `b93c91c`. Root cause was
   deeper than the original audit's `/v1/traces` finding: 28 call sites
