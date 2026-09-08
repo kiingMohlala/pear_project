@@ -15,11 +15,15 @@ from .jira_connector import JiraConnector
 from .quant_connector import QuantConnector
 
 
-def build_default_connectors(workspace=None, credential_store: Optional[CredentialStore] = None) -> ConnectorRegistry:
+def build_default_connectors(
+    workspace=None,
+    credential_store: Optional[CredentialStore] = None,
+    calendar_store_path=None,
+) -> ConnectorRegistry:
     reg = ConnectorRegistry(credential_store=credential_store)
     reg.register(LocalFilesConnector(workspace=workspace))
     reg.register(EmailConnector())
-    reg.register(CalendarConnector())
+    reg.register(CalendarConnector(store_path=calendar_store_path))
     reg.register(GitHubConnector())
     # n8n is optional and disabled until base_url is configured
     reg.register(N8NConnector())

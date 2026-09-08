@@ -48,19 +48,29 @@ for _g in PERM_GROUPS.values():
 class Workspace:
     """
     Restricts automation to approved roots.
-    Default: ~/PEAR_Workspace (created if missing) + optional extras.
+
+    PEAR 3.1 Gate 11: pass explicit `roots` for a properly-owned,
+    per-user workspace (Orchestrator does this, rooted under
+    memory.persist_dir). Only bare `Workspace()` construction (the CLI,
+    ad-hoc scripts) falls back to the machine-global default
+    ~/PEAR_Workspace — that's fine for a single-user context, but must
+    never be what a multi-user service path silently gets.
     """
 
     def __init__(self, roots: Optional[List[Path]] = None):
+        if roots:
+            self.roots: List[Path] = []
+            for r in roots:
+                self.add_root(r)
+            return
         default = Path.home() / "PEAR_Workspace"
         try:
             default.mkdir(parents=True, exist_ok=True)
         except OSError:
             default = Path.cwd() / "PEAR_Workspace"
             default.mkdir(parents=True, exist_ok=True)
-        self.roots: List[Path] = []
-        for r in roots or [default]:
-            self.add_root(r)
+        self.roots = []
+        self.add_root(default)
 
     def add_root(self, path: Path | str) -> Path:
         p = Path(path).expanduser().resolve()

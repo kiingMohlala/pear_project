@@ -85,8 +85,21 @@ class SessionManager:
                     # unused while every action actually ran through a
                     # different, second manager instance.
                     orch.register(cls(browser_manager=orch.browser_manager))
-                elif cls in (DesktopAgent, ComputerUseAgent):
-                    orch.register(cls())
+                elif cls is DesktopAgent:
+                    # PEAR 3.1 Gate 11: explicit injection of this
+                    # orchestrator's own Workspace. Without this,
+                    # DesktopAgent would fall back to constructing its own
+                    # bare Workspace() — machine-global ~/PEAR_Workspace,
+                    # shared by every user regardless of persist_dir.
+                    orch.register(cls(workspace=orch.workspace))
+                elif cls is ComputerUseAgent:
+                    # PEAR 3.1 Gate 11: same reasoning — inject this
+                    # orchestrator's own already-scoped controller/media
+                    # instead of letting the agent build its own bare
+                    # ComputerController()/MediaManager(), both of which
+                    # defaulted to the same machine-global
+                    # ~/PEAR_Workspace subdirectories for every user.
+                    orch.register(cls(controller=orch.computer_controller, media=orch.media))
                 else:
                     orch.register(cls(llm=llm))
             except Exception:

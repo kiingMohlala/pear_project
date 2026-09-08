@@ -119,11 +119,27 @@ class Orchestrator:
             wf_dir = _P(self.memory.persist_dir) / "workflows"
         self.workflows = WorkflowRunner(self, persist_dir=wf_dir)
 
+        # PEAR 3.1 Gate 11: Workspace scoped per-user under
+        # memory.persist_dir, same pattern as tracer/jobs/credentials.
+        # Previously this was always a bare Workspace() — which
+        # unconditionally defaults to the machine-global ~/PEAR_Workspace
+        # regardless of who's asking — meaning every user's DesktopAgent
+        # and LocalFilesConnector shared one real directory on disk.
+        # Falls back to Workspace()'s own machine-global default only when
+        # there's no per-user persist_dir at all (bare/CLI construction),
+        # matching how every other per-user subsystem here degrades.
+        self.workspace = None
         try:
             from .desktop import Workspace
-            ws = Workspace()
+            if getattr(self.memory, "persist_dir", None):
+                from pathlib import Path as _P
+                ws_root = _P(self.memory.persist_dir) / "workspace"
+                self.workspace = Workspace(roots=[ws_root])
+            else:
+                self.workspace = Workspace()
         except Exception:
-            ws = None
+            self.workspace = None
+        ws = self.workspace
 
         # PEAR 3.1 Gate 3: credentials scoped per-user, same pattern as
         # jobs.sqlite/traces.sqlite/workflows above. Falls back to the old
@@ -132,12 +148,22 @@ class Orchestrator:
         # such as in quick scripts/tests) — matching how every other
         # per-user subsystem here already degrades.
         cred_store = None
+        calendar_store_path = None
         if getattr(self.memory, "persist_dir", None):
             from pathlib import Path as _P
             from .connectors import CredentialStore
             cred_path = _P(self.memory.persist_dir) / "credentials.enc"
             cred_store = CredentialStore(path=cred_path)
-        self.connectors = build_default_connectors(workspace=ws, credential_store=cred_store)
+            # PEAR 3.1 Gate 11: same per-user scoping for the calendar
+            # store — previously CalendarConnector() was constructed bare,
+            # always defaulting to the machine-global ~/.pear/calendar.json
+            # shared by every user regardless of persist_dir.
+            calendar_store_path = _P(self.memory.persist_dir) / "calendar.json"
+        self.connectors = build_default_connectors(
+            workspace=ws,
+            credential_store=cred_store,
+            calendar_store_path=calendar_store_path,
+        )
 
         # PEAR 3.1 Gate 10: per-user BrowserManager, same ownership pattern
         # as tracer/jobs/credentials above. Previously agents/browser_agent.py
@@ -160,6 +186,20 @@ class Orchestrator:
             from pathlib import Path as _P
             media_dir = _P(self.memory.persist_dir) / "media"
         self.media = MediaManager(knowledge=self.memory.knowledge, media_dir=media_dir)
+
+        # PEAR 3.1 Gate 11: per-user ComputerController, same pattern.
+        # Previously agents/computer_use_agent.py constructed its own bare
+        # ComputerController() (and its own bare MediaManager() — see the
+        # injection in service/sessions.py instead of here for that one),
+        # defaulting screenshot storage to the same machine-global
+        # ~/PEAR_Workspace/ui_captures every user shared.
+        from .computer import ComputerController as _ComputerController
+        screenshot_dir = None
+        if getattr(self.memory, "persist_dir", None):
+            from pathlib import Path as _P
+            screenshot_dir = _P(self.memory.persist_dir) / "ui_captures"
+        self.computer_controller = _ComputerController(screenshot_dir=screenshot_dir)
+
         self.plugin_commands = {}
         plug_dir = None
         if getattr(self.memory, "persist_dir", None):

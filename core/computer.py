@@ -57,7 +57,14 @@ class ActionLog:
 
 
 class ComputerController:
-    """Low-level GUI control with simulation fallback."""
+    """Low-level GUI control with simulation fallback.
+
+    PEAR 3.1 Gate 11: pass an explicit screenshot_dir for per-user
+    ownership (Orchestrator does this). Bare construction (CLI, tests)
+    falls back to the machine-global ~/PEAR_Workspace/ui_captures —
+    fine for single-user context, must not be what a service path
+    silently gets.
+    """
 
     def __init__(self, screenshot_dir: Optional[Path] = None):
         self.backend = _backend()

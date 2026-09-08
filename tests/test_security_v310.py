@@ -1442,6 +1442,261 @@ def test_gate10_i_concurrent_30_users_no_shared_browser_state():
             assert url == f"https://{u}-only.example", f"{u}: session state does not match what this user wrote"
 
 
+# ── Gate 11: per-user filesystem isolation ──────────────────────────────
+
+def test_gate11_a_workspace_isolation():
+    """A. Alice writes alice_secret.txt. Bob must be unable to list,
+    search, open, copy, move, or delete it — and vice versa."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice_da = sm.get("alice").orchestrator.agents.get("desktop")
+        bob_da = sm.get("bob").orchestrator.agents.get("desktop")
+
+        alice_root = alice_da.workspace.list_roots()[0]
+        bob_root = bob_da.workspace.list_roots()[0]
+        assert alice_root != bob_root
+
+        secret_path = alice_root + "/alice_secret.txt"
+        with open(secret_path, "w") as f:
+            f.write("ALICE PRIVATE DATA — do not share")
+
+        # list: bob's own workspace listing must not include it
+        listing = bob_da.use_tool("list_directory", bob_root)
+        assert "alice_secret.txt" not in json.dumps(listing)
+
+        # search: bob searching his own root must not find it
+        found = bob_da.use_tool("search_files", bob_root, "alice_secret*")
+        assert found.get("count", 0) == 0
+
+        # open/read: bob cannot even resolve alice's path — it's outside his workspace
+        try:
+            bob_da.workspace.require_inside(secret_path)
+            assert False, "bob's workspace incorrectly permitted a path inside alice's workspace"
+        except PermissionError:
+            pass
+
+        # copy/move/delete: exercised through the REAL request path
+        # (orch.route() -> DesktopAgent._process() -> the guarded
+        # _copy/_move/_delete methods, which pass workspace=self.workspace,
+        # allow_outside=False) — not through use_tool() directly. The
+        # raw ToolRegistry-registered copy_file/move_file/delete_file
+        # (core/tools.py) are thin wrappers that hardcode workspace=None,
+        # allow_outside=True and enforce no boundary at all by themselves;
+        # DesktopAgent never calls them that way during normal dispatch
+        # (_process() only ever reaches the guarded _copy/_move/_delete
+        # methods — confirmed by reading every branch), so this isn't
+        # reachable from any real user-facing path today. Flagged in
+        # docs/AUDIT.md as a latent defense-in-depth gap rather than
+        # silently ignored, since a future caller that reached those raw
+        # tools directly (bypassing the agent's own dispatch) would get
+        # zero enforcement.
+        bob_orch = sm.get("bob").orchestrator
+        r1 = bob_orch.route(f"copy {secret_path} to {bob_root}/stolen.txt")
+        assert not Path(bob_root, "stolen.txt").exists(), "copy across the workspace boundary should have been denied"
+
+        r2 = bob_orch.route(f"move {secret_path} to {bob_root}/stolen2.txt")
+        assert not Path(bob_root, "stolen2.txt").exists(), "move across the workspace boundary should have been denied"
+
+        r3 = bob_orch.route(f"delete {secret_path}")
+        assert Path(secret_path).exists(), "delete across the workspace boundary should have been denied"
+
+        assert Path(secret_path).exists(), "alice's file must be untouched after bob's attempts"
+
+        # and vice versa: alice cannot reach into bob's workspace either
+        bob_secret = bob_root + "/bob_secret.txt"
+        with open(bob_secret, "w") as f:
+            f.write("BOB PRIVATE DATA")
+        try:
+            alice_da.workspace.require_inside(bob_secret)
+            assert False, "alice's workspace incorrectly permitted a path inside bob's workspace"
+        except PermissionError:
+            pass
+
+
+def test_gate11_b_calendar_isolation():
+    """B. Alice's private event must not appear in, or be affected by,
+    Bob's list_events/get_event/update/delete."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice_cal = sm.get("alice").orchestrator.connectors.get("calendar")
+        bob_cal = sm.get("bob").orchestrator.connectors.get("calendar")
+        assert alice_cal.store_path != bob_cal.store_path
+
+        alice_cal.connect()
+        create_result = alice_cal.execute("create_event", title="Alice therapy appointment")
+        event_id = (create_result.data or {}).get("id") or (create_result.data or {}).get("event", {}).get("id")
+
+        bob_cal.connect()
+        listed = bob_cal.execute("list_events")
+        assert "Alice therapy appointment" not in json.dumps(listed.data)
+
+        if event_id:
+            got = bob_cal.execute("get_event", id=event_id)
+            assert got.ok is False or not got.data, "bob should not be able to fetch alice's event by id"
+
+            # update/delete against an id that doesn't exist in BOB's own
+            # store correctly no-ops (ok=True, zero events affected) rather
+            # than raising — that's fine and expected. The real property
+            # to verify is that alice's event is untouched afterward,
+            # checked below.
+            bob_cal.execute("update_event", id=event_id, title="tampered by bob")
+            bob_cal.execute("delete_event", id=event_id)
+
+        # alice's event must still be exactly as she left it
+        alice_listed = alice_cal.execute("list_events")
+        assert "Alice therapy appointment" in json.dumps(alice_listed.data)
+
+
+def test_gate11_c_media_isolation():
+    """C. Alice's media artifacts (screenshots/OCR output) must not be
+    visible to Bob."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice_cu = sm.get("alice").orchestrator.agents.get("computer")
+        bob_cu = sm.get("bob").orchestrator.agents.get("computer")
+
+        assert alice_cu.media is not bob_cu.media
+        assert alice_cu.media.media_dir != bob_cu.media.media_dir
+        assert alice_cu.controller is not bob_cu.controller
+        assert alice_cu.controller.screenshot_dir != bob_cu.controller.screenshot_dir
+
+        Path(alice_cu.media.media_dir).mkdir(parents=True, exist_ok=True)
+        artifact = Path(alice_cu.media.media_dir) / "alice_screenshot.png"
+        artifact.write_bytes(b"fake png bytes for alice")
+
+        bob_dir = Path(bob_cu.media.media_dir)
+        bob_dir.mkdir(parents=True, exist_ok=True)
+        bob_files = list(bob_dir.iterdir())
+        assert not any("alice" in f.name for f in bob_files), "bob's media directory should not contain alice's artifact"
+
+
+def test_gate11_d_30_user_filesystem_isolation():
+    """D. 30 concurrent users, each creates a uniquely identifiable file,
+    each lists/searches its own workspace, each attempts to discover
+    another user's files. Zero cross-user visibility."""
+    from service.sessions import SessionManager
+    N = 30
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        usernames = [f"fsuser{i}" for i in range(N)]
+        errors = []
+        roots = {}
+        lock = threading.Lock()
+
+        def worker(u):
+            try:
+                da = sm.get(u).orchestrator.agents.get("desktop")
+                root = da.workspace.list_roots()[0]
+                marker = f"{u}_UNIQUE_MARKER"
+                with open(Path(root) / f"{marker}.txt", "w") as f:
+                    f.write(marker)
+                own_listing = da.use_tool("list_directory", root)
+                with lock:
+                    roots[u] = (root, json.dumps(own_listing))
+            except Exception as e:
+                with lock:
+                    errors.append(f"{u}: {e}")
+
+        threads = [threading.Thread(target=worker, args=(u,)) for u in usernames]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, "errors during concurrent filesystem workload:\n" + "\n".join(errors)
+        assert len(set(r[0] for r in roots.values())) == N, "expected 30 distinct workspace roots"
+
+        for u, (root, listing) in roots.items():
+            assert f"{u}_UNIQUE_MARKER" in listing, f"{u} should see its own file"
+            for other_u in usernames:
+                if other_u == u:
+                    continue
+                assert f"{other_u}_UNIQUE_MARKER" not in listing, f"CROSS-USER LEAK: {u} sees {other_u}'s file"
+
+
+def test_gate11_e_restart_persistence():
+    """E. Alice writes persistent data (a file + a calendar event),
+    PEAR restarts, Alice recovers her data, Bob still cannot see it."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        data_root = Path(td)
+        sm1 = SessionManager(data_root=data_root, llm=EchoLLM())
+        alice1 = sm1.get("alice").orchestrator
+        alice_da1 = alice1.agents.get("desktop")
+        alice_root = alice_da1.workspace.list_roots()[0]
+        with open(Path(alice_root) / "persistent_secret.txt", "w") as f:
+            f.write("survives restart")
+        alice1.connectors.get("calendar").connect()
+        alice1.connectors.get("calendar").execute("create_event", title="Alice recurring private meeting")
+
+        # "restart" — brand new SessionManager/Orchestrator, same on-disk root
+        sm2 = SessionManager(data_root=data_root, llm=EchoLLM())
+        alice2 = sm2.get("alice").orchestrator
+        bob2 = sm2.get("bob").orchestrator
+
+        alice_da2 = alice2.agents.get("desktop")
+        assert alice_da2.workspace.list_roots()[0] == alice_root
+        recovered = alice_da2.use_tool("search_files", alice_root, "persistent_secret*")
+        assert recovered.get("count", 0) == 1, "alice's file should survive restart"
+
+        alice_cal2 = alice2.connectors.get("calendar")
+        alice_cal2.connect()
+        assert "Alice recurring private meeting" in json.dumps(alice_cal2.execute("list_events").data)
+
+        bob_da2 = bob2.agents.get("desktop")
+        bob_root2 = bob_da2.workspace.list_roots()[0]
+        assert bob_root2 != alice_root
+        bob_search = bob_da2.use_tool("search_files", bob_root2, "persistent_secret*")
+        assert bob_search.get("count", 0) == 0, "bob must not see alice's file after restart either"
+
+        bob_cal2 = bob2.connectors.get("calendar")
+        bob_cal2.connect()
+        assert "Alice recurring private meeting" not in json.dumps(bob_cal2.execute("list_events").data)
+
+
+def test_gate11_f_path_traversal():
+    """F. Traversal attempts must be rejected regardless of form."""
+    from service.sessions import SessionManager
+    with tempfile.TemporaryDirectory() as td:
+        sm = SessionManager(data_root=Path(td), llm=EchoLLM())
+        alice_da = sm.get("alice").orchestrator.agents.get("desktop")
+        bob_da = sm.get("bob").orchestrator.agents.get("desktop")
+        root = alice_da.workspace.list_roots()[0]
+        bob_root = bob_da.workspace.list_roots()[0]
+
+        attacks = [
+            root + "/../alice_secret.txt",
+            root + "/../../alice_secret.txt",
+            "/etc/passwd",
+            str(Path.home()) + "/PEAR_Workspace/anything",
+            bob_root,  # a whole different user's root, verbatim
+            root + "/../" + Path(bob_root).name + "/bob_secret.txt",
+        ]
+        for a in attacks:
+            try:
+                alice_da.workspace.require_inside(a)
+                # only acceptable if it happens to still resolve inside alice's own root
+                resolved = alice_da.workspace.resolve(a)
+                assert alice_da.workspace.is_inside(resolved), f"traversal succeeded outside alice's workspace: {a!r} -> {resolved}"
+            except PermissionError:
+                pass  # expected
+
+
+def test_gate11_g_bare_construction_still_isolated():
+    """Bare construction (CLI/eval harness — no injected workspace/media/
+    controller) must still work, and still not accidentally share state
+    between two separate bare instances."""
+    from agents import DesktopAgent, ComputerUseAgent
+    d1, d2 = DesktopAgent(), DesktopAgent()
+    assert d1.workspace is not d2.workspace
+    c1, c2 = ComputerUseAgent(), ComputerUseAgent()
+    assert c1.media is not c2.media
+    assert c1.controller is not c2.controller
+
+
 if __name__ == "__main__":
     test_gate1_concurrent_traces_no_cross_user_leak()
     print("  ✓ gate1 concurrent traces — no cross-user leak")
@@ -1523,4 +1778,18 @@ if __name__ == "__main__":
     print("  ✓ gate10h restart isolation")
     test_gate10_i_concurrent_30_users_no_shared_browser_state()
     print("  ✓ gate10i 30 concurrent users, no shared browser state")
+    test_gate11_a_workspace_isolation()
+    print("  ✓ gate11a workspace isolation")
+    test_gate11_b_calendar_isolation()
+    print("  ✓ gate11b calendar isolation")
+    test_gate11_c_media_isolation()
+    print("  ✓ gate11c media isolation")
+    test_gate11_d_30_user_filesystem_isolation()
+    print("  ✓ gate11d 30-user filesystem isolation")
+    test_gate11_e_restart_persistence()
+    print("  ✓ gate11e restart persistence")
+    test_gate11_f_path_traversal()
+    print("  ✓ gate11f path traversal rejected")
+    test_gate11_g_bare_construction_still_isolated()
+    print("  ✓ gate11g bare construction still isolated")
     print("All PEAR 3.1 security tests passed (gates implemented so far).")
