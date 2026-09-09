@@ -2,52 +2,123 @@
 
 ## PEAR 3.1 — Ownership, Isolation & Concurrency Hardening
 
-**Status: Gates 1-9 complete as of `b936b1d`; frozen and independently
-re-audited from a fresh clone (tag `pear-3.1-frozen`, commit `c5b481a`)
-without relying on Gates 1-9's own conclusions. The re-audit found one
-confirmed HIGH-severity finding the original 9 gates never touched — a
-process-global browser session singleton, `core/browser.py`'s
-`get_browser_manager()` — fixed as Gate 10 (`45ff40c`). All 10 gates now
-complete.**
+**Status: Gates 1-11 complete as of `7ef25ca`; frozen after Gate 10
+(tag `pear-3.1-frozen`, commit `c5b481a`) and independently re-audited a
+second time from a fresh clone of the post-Gate-10 state (`6b6c7b5`),
+again without relying on any prior gate's conclusions, existing tests,
+or reasoning as evidence. Re-Audit 2 found three more confirmed bugs —
+two HIGH, one MEDIUM — sharing Gate 10's exact root cause
+(a `Path.home()`-based default never threaded through per-user scoping)
+but not caught by Gate 10, which was scoped specifically to the browser
+finding rather than the general pattern. Fixed as Gate 11 (`7ef25ca`).**
 
-The re-audit's own words, worth keeping verbatim rather than summarizing
-away: *"the browser-session singleton is a real, high-severity,
-currently-shipping cross-user leak, found specifically by asking 'what
-other object could bypass this' rather than checking the known fix
-locations — which is exactly what you asked me to do, and exactly what a
-same-author re-audit is at risk of missing."* The re-audit also
-confirmed the browser bug **predates PEAR 3.1 entirely** — not a
-regression from Gates 1-9, and honestly noted that the original
-architecture audit (which started this whole hardening pass) missed it
-too, having flagged `BrowserAgent`'s approval-gating as a strength
-without examining the session-sharing layer underneath it.
+Re-Audit 2's verdict was explicit: **NOT READY**, with two HIGH-severity
+findings (`Workspace`/`DesktopAgent` file access, `CalendarConnector`)
+and one MEDIUM (`ComputerUseAgent`'s `MediaManager`/`ComputerController`),
+each reproduced concretely — alice's file content and calendar event
+title both read back verbatim through bob's own agents, no exploit
+chain required beyond normal chat usage. Re-Audit 2 also confirmed,
+independently, that the properties Gates 1-10 established still hold
+(tracer, credentials, browser, the TOCTOU window, the class-attribute
+mutable-default gotcha, FastAPI/stdlib parity) — it did not merely find
+new bugs, it re-verified the old fixes hadn't regressed, matching the
+same standard as Re-Audit 1.
 
-Two lower-severity items the re-audit surfaced and did **not** treat as
-blocking Gate 10 — logged here rather than silently dropped:
-- A narrow TOCTOU window in Gate 6's `evict()`: the busy-check and the
-  actual `del self._sessions[user_id]` are atomic under `SessionManager`'s
-  own lock, but a job can transition `QUEUED → RUNNING` under
-  `JobManager`'s separate lock in the gap between them. Mitigated by
-  `jobs.stop(timeout=2.0)` still gracefully joining a just-started worker
-  thread on shutdown; not theoretically closed for jobs that take longer
-  than 2s to begin real work. Same-user impact only, no cross-user
-  exposure.
-- `evaluation/engine.py`'s offline harness constructs bare `Orchestrator`
-  instances without a `persist_dir` in some of its own internal test
-  setup, which falls back to the pre-Gate-3 global credential path. Not
-  reachable through the live service — no attacker path — noted for
-  completeness only.
+### Filesystem ownership map (built before Gate 11 touched any code)
 
-Recommended next step, still not yet done: re-run the full architecture
-audit **again**, fresh, against the Gate-10-frozen state, the same way
-the Gate 10 re-audit was run against the Gate-9 state — since a same-
-author audit that already knows about Gate 10 is exactly the risk this
-whole process has been designed to catch twice now.
+| Component | Storage | Owner | Scope | Status |
+|---|---|---|---|---|
+| Tracer | traces.sqlite | Orchestrator/user | Per-user | ✅ (Gate 1) |
+| Credentials | credentials.enc + .cred_key | Orchestrator/user | Per-user | ✅ (Gate 3) |
+| Browser | session state + browser_downloads/ | Orchestrator/user | Per-user | ✅ (Gate 10) |
+| Jobs | jobs.sqlite | Orchestrator/user | Per-user | ✅ |
+| Goals | goals/*.json | Orchestrator/user (self-derives from `memory.persist_dir`) | Per-user | ✅ |
+| Workflows | workflows/*.json | Orchestrator/user | Per-user | ✅ |
+| Learning | learning/ | Orchestrator/user (self-derives) | Per-user | ✅ |
+| Self-improve | self_improve/ | Orchestrator/user (self-derives) | Per-user | ✅ (dormant in the service today, but correctly scoped) |
+| **Workspace (desktop files)** | `PEAR_Workspace/` | Orchestrator/user | Per-user | ✅ (Gate 11 — was 🔴 machine-global) |
+| **Calendar** | `calendar.json` | Orchestrator/user | Per-user | ✅ (Gate 11 — was 🔴 machine-global) |
+| **Media (ComputerUseAgent)** | `media/` | Orchestrator/user | Per-user | ✅ (Gate 11 — was 🔴 machine-global; `Orchestrator.media` was already correct, the agent just wasn't using it) |
+| **UI screenshots (ComputerController)** | `ui_captures/` | Orchestrator/user | Per-user | ✅ (Gate 11 — was 🔴 machine-global) |
+| WorkerManager dispatch state | (computed, never written) | n/a | n/a — inert | 🟡 not exploitable today — no I/O occurs at all (Gate 4/5/7 finding, unchanged) |
+| Quant connector research memory | `quant_connector/` | shared, by connector-name only | Ambiguous | 🟡 not evaluated in Gate 11 — flagged, not fixed; Quant is explicitly a shared research system by design, but whether `research_memory.json` records per-query specifics that should be user-scoped hasn't been decided |
+| Raw `copy_file`/`move_file` tool functions | n/a — no storage of their own | n/a | n/a | 🟡 unsafe-by-default (`workspace=None, allow_outside=True` hardcoded) but not reachable from any real request path — `DesktopAgent._process()` only ever calls the guarded `_copy`/`_move`/`_delete` methods. Latent defense-in-depth gap, not fixed in Gate 11. |
+| AuditLog | `root/audit.jsonl` | server (`PearService` root) | Server-global by design | ✅ — intentional, centralized security log |
+| AuthManager users/sessions | `root/users.json`, `root/sessions.json` | server | Server-global by design | ✅ — intentional, one shared user database |
+| SessionManager data_root | `root/sessions/<user>/...` | server config default | Server-global config, subdivides per-user underneath | ✅ |
+| `PearService` root | `PEAR_DATA` env or `~/.pear` | server config default | Server-global config | ✅ |
+| `core/config.py` `Config` | `~/.pear/config.json` | server config default | Server-global config, non-user-data | ✅ |
 
-Status of the (now 10-gate) task card. Each gate is only marked done
+The architectural rule going forward, stated once so it doesn't need
+restating per-component: **if data belongs to a user, its storage
+boundary must originate from that user's Orchestrator/session context
+and be explicitly injected into the component that owns the data.**
+`Path.home()` itself was never the problem — `core/config.py`,
+`AuditLog`, and `AuthManager` all legitimately use it for real
+server-wide configuration and are correctly left alone. The problem was
+always specific default parameters silently standing in for that
+injection.
+
+Recommended next step, still not yet done: a **third** independent
+re-audit, fresh, against the Gate-11-frozen state — the same way
+Re-Audit 2 was run against the Gate-10 state. If it finds another
+`Path.home()`-style leak, the right response is to expand the
+architectural rule and sweep the whole codebase against it once, rather
+than opening a Gate 12 for one more isolated component.
+
+Status of the (now 11-gate) task card. Each gate is only marked done
 once it has a real test that (a) fails against the pre-fix code via
 `git stash` and (b) passes against the fix, run stable across repeated
 full-suite runs — not just "code written."
+
+- 🟢 **Gate 11 — Per-user filesystem isolation.** Fixed in `7ef25ca`.
+  Found by Re-Audit 2, not by any of Gates 1-10: three components each
+  defaulted to a `Path.home()`-based, machine-global path instead of a
+  per-user one — `core/desktop.py`'s `Workspace`
+  (`~/PEAR_Workspace`, feeding both `DesktopAgent` and
+  `LocalFilesConnector`), `core/connectors/calendar_connector.py`'s
+  `CalendarConnector` (`~/.pear/calendar.json`), and
+  `ComputerUseAgent`'s own separately-constructed `MediaManager` +
+  `ComputerController` (`~/PEAR_Workspace/media`,
+  `~/PEAR_Workspace/ui_captures`) — the last one despite
+  `Orchestrator.media` already being correctly per-user scoped; the
+  agent just wasn't receiving it. Reproduced directly before any code
+  change: alice writes a file containing unmistakably private text via
+  her own `DesktopAgent`; bob's `DesktopAgent.search_files` finds it
+  immediately. Alice creates a private calendar event; bob's
+  `list_events` returns it verbatim — the shared file already held
+  events from unrelated earlier test runs, not even scoped to a tempdir
+  by default. Fixed with the same pattern as Gates 1/3/10: `Orchestrator`
+  now owns `self.workspace` and `self.computer_controller` (alongside
+  the pre-existing `self.media`), all rooted under `memory.persist_dir`;
+  `build_default_connectors()` threads a per-user `calendar_store_path`
+  the same way it already threaded `credential_store` in Gate 3;
+  `SessionManager` explicitly injects the right instance into
+  `DesktopAgent`/`ComputerUseAgent`, same injection pattern Gate 10
+  established for `BrowserAgent`. Bare construction (the CLI, the
+  evaluation harness) still works with zero required arguments and is
+  now *more* isolated too, not just preserved — `Workspace()` previously
+  created the machine-global directory as a side effect even when a
+  caller passed its own explicit roots; that's now conditional. Actively
+  attacked path traversal (6 payloads plus a same-service different
+  user's real workspace root) against `Workspace.require_inside()` —
+  already robust (resolves symlinks/`..` via `Path.resolve()` before
+  checking containment), confirmed rather than assumed. Found and
+  flagged, not fixed: the raw `ToolRegistry`-registered `copy_file`/
+  `move_file` functions in `core/tools.py` enforce no boundary by
+  themselves (hardcoded `workspace=None, allow_outside=True`) — not
+  reachable from any real request path today since `DesktopAgent`'s own
+  dispatch never calls them that way, but a latent gap for any future
+  caller that did. 7 tests (A-G), 5 of 7 confirmed to fail against the
+  pre-fix code via `git stash` — including the 30-user test collapsing
+  to a single shared root, and the restart test asserting bob's root
+  equals alice's and getting exactly that. The other 2 (path traversal,
+  bare-construction isolation) correctly pass either way since Gate 11
+  didn't need to change that logic — noted honestly rather than claimed
+  as gate-specific proof. Caught and fixed two bugs in my own first test
+  draft before trusting the suite — one of which surfaced the raw-tool
+  latent gap above by accident, testing it via the unguarded path
+  instead of the real one.
 
 - 🟢 **Gate 10 — Browser session ownership & isolation.** Fixed in
   `45ff40c`. Found by the independent frozen-state re-audit, not by any
@@ -81,6 +152,32 @@ full-suite runs — not just "code written."
   against the pre-fix singleton via `git stash` — including the 30-user
   test, which showed the literal mechanism directly: all 30 usernames
   collapsing to one shared object id.
+
+**Lower-severity items surfaced by Re-Audit 1 and Re-Audit 2, not treated
+as blocking either gate — logged here rather than silently dropped:**
+- A narrow TOCTOU window in Gate 6's `evict()`: the busy-check and the
+  actual `del self._sessions[user_id]` are atomic under `SessionManager`'s
+  own lock, but a job can transition `QUEUED → RUNNING` under
+  `JobManager`'s separate lock in the gap between them. Re-Audit 2
+  attempted to manufacture a real violation with a tight polling loop
+  racing eviction against job start and could not produce actual data
+  loss or corruption — the job always completed correctly. Mitigated by
+  `jobs.stop(timeout=2.0)` still gracefully joining a just-started worker
+  thread on shutdown; not theoretically closed for jobs that take longer
+  than 2s to begin real work. Same-user impact only, no cross-user
+  exposure.
+- `evaluation/engine.py`'s offline harness constructs bare `Orchestrator`
+  instances without a `persist_dir` in some of its own internal test
+  setup, which falls back to the pre-Gate-3 global credential path. Not
+  reachable through the live service — no attacker path — noted for
+  completeness only.
+- Re-Audit 2 also actively re-tested and ruled out: a classic Python
+  mutable-class-attribute gotcha (AST-swept `core/`, `agents/`,
+  `service/` for class-body mutable defaults — found only static,
+  never-mutated capability-metadata lists), agent-to-sibling-orchestrator
+  reach (no agent holds a reference to another user's orchestrator), and
+  worker-registration bypass (no HTTP route exists to register a worker
+  on either surface).
 
 - 🟢 **Gate 1 — Tracer isolation.** Fixed in `b93c91c`. Root cause was
   deeper than the original audit's `/v1/traces` finding: 28 call sites
