@@ -18,27 +18,45 @@ class ResearchMemory:
         self._load()
 
     def _load(self) -> None:
-        if not self.path.exists():
+        from core.security import safe_load_text
+        raw = safe_load_text(self.path, on_corrupt_label="quant research memory")
+        if raw is None:
             return
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            for d in data.get("experiments") or []:
-                rec = ExperimentRecord.from_dict(d)
-                self.experiments[rec.id] = rec
+            data = json.loads(raw)
         except Exception:
-            self.experiments = {}
+            return
+        # Additive merge, not full replace: this is also called mid-add()
+        # (Gate 12) to pick up other threads'/sessions' writes before
+        # this one saves. A full replace would swap out objects a caller
+        # is already holding a live reference to (e.g. the Hypothesis
+        # returned by an earlier call) with a freshly-deserialized copy,
+        # silently dropping in-place mutations made after that point —
+        # so only ids not already known in memory are pulled in from disk.
+        for d in data.get("experiments") or []:
+            rec = ExperimentRecord.from_dict(d)
+            if rec.id not in self.experiments:
+                self.experiments[rec.id] = rec
 
     def _save(self) -> None:
+        from core.security import atomic_write_text
         payload = {
             "experiments": [e.to_dict() for e in self.experiments.values()],
         }
-        self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        atomic_write_text(self.path, json.dumps(payload, indent=2))
 
     def add(self, exp: ExperimentRecord) -> None:
-        if exp.id in self.experiments and self.experiments[exp.id].sealed:
-            raise RuntimeError("cannot overwrite sealed experiment")
-        self.experiments[exp.id] = exp
-        self._save()
+        # PEAR 3.1 Gate 12: lock, then reload before mutating, so this
+        # writer starts from whatever's actually on disk right now — not
+        # a snapshot taken back when this ResearchMemory was constructed
+        # — before writing the merged result back out.
+        from core.security import locked_json_store
+        with locked_json_store(self.path):
+            self._load()
+            if exp.id in self.experiments and self.experiments[exp.id].sealed:
+                raise RuntimeError("cannot overwrite sealed experiment")
+            self.experiments[exp.id] = exp
+            self._save()
 
     def get(self, exp_id: str) -> ExperimentRecord:
         return self.experiments[exp_id]

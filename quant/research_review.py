@@ -34,21 +34,39 @@ class ResearchReviewBoard:
         self._load()
 
     def _load(self) -> None:
-        if not self.persist_path.exists():
+        from core.security import safe_load_text
+        raw = safe_load_text(self.persist_path, on_corrupt_label="quant review board")
+        if raw is None:
             return
         try:
-            data = json.loads(self.persist_path.read_text(encoding="utf-8"))
-            self.decisions = list(data.get("decisions") or [])
+            data = json.loads(raw)
         except Exception:
-            pass
+            return
+        # Additive merge (Gate 12), same reasoning as the other two quant
+        # stores. Decisions have no stable id field, so dedup by content
+        # instead — appended once, never mutated afterward, so an exact
+        # match means "already have this one", not "stale copy of it".
+        existing = {json.dumps(d, sort_keys=True) for d in self.decisions}
+        for d in data.get("decisions") or []:
+            key = json.dumps(d, sort_keys=True)
+            if key not in existing:
+                self.decisions.append(d)
+                existing.add(key)
+        # Gate 12: scorecards were persisted by _save() but never actually
+        # read back here — every reload silently lost every scorecard
+        # that wasn't still sitting in this instance's own memory.
+        for k, v in (data.get("scorecards") or {}).items():
+            if k not in self.scorecards:
+                self.scorecards[k] = CandidateScorecard.from_dict(v)
 
     def _save(self) -> None:
-        self.persist_path.write_text(
+        from core.security import atomic_write_text
+        atomic_write_text(
+            self.persist_path,
             json.dumps({
                 "decisions": self.decisions[-500:],
                 "scorecards": {k: v.to_dict() for k, v in self.scorecards.items()},
             }, indent=2),
-            encoding="utf-8",
         )
 
     def independent_evaluate(
@@ -109,15 +127,22 @@ class ResearchReviewBoard:
         if not review.robustness.get("passed"):
             card.failure_modes = list(dict.fromkeys(card.failure_modes + ["independent_robustness_failed"]))
         card.compute_composite()
-        self.scorecards[cid] = card
-        self._save()
+
+        from core.security import locked_json_store
+        with locked_json_store(self.persist_path):
+            self._load()
+            self.scorecards[cid] = card
+            self._save()
         return card
 
     def make_decision(self, candidate_id: str) -> ResearchDecision:
-        card = self.scorecards[candidate_id]
-        dec = decide(card)
-        self.decisions.append(dec.to_dict())
-        self._save()
+        from core.security import locked_json_store
+        with locked_json_store(self.persist_path):
+            self._load()
+            card = self.scorecards[candidate_id]
+            dec = decide(card)
+            self.decisions.append(dec.to_dict())
+            self._save()
         return dec
 
     def compare(self, candidate_ids: Optional[List[str]] = None) -> Dict[str, Any]:

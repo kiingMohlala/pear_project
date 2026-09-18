@@ -41,19 +41,27 @@ class HypothesisEngine:
         self._load()
 
     def _load(self) -> None:
-        if not self.persist_path.exists():
+        from core.security import safe_load_text
+        raw = safe_load_text(self.persist_path, on_corrupt_label="quant hypotheses store")
+        if raw is None:
             return
         try:
-            data = json.loads(self.persist_path.read_text(encoding="utf-8"))
-            for d in data.get("hypotheses") or []:
-                h = Hypothesis.from_dict(d)
-                self.hypotheses[h.id] = h
+            data = json.loads(raw)
         except Exception:
-            pass
+            return
+        # Additive merge (Gate 12), same reasoning as ResearchMemory._load:
+        # only pull in ids not already resident in memory, so a caller
+        # holding a live reference to a Hypothesis this call is about to
+        # mutate in place never has it silently swapped out from under it.
+        for d in data.get("hypotheses") or []:
+            h = Hypothesis.from_dict(d)
+            if h.id not in self.hypotheses:
+                self.hypotheses[h.id] = h
 
     def _save(self) -> None:
+        from core.security import atomic_write_text
         payload = {"hypotheses": [h.to_dict() for h in self.hypotheses.values()]}
-        self.persist_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        atomic_write_text(self.persist_path, json.dumps(payload, indent=2))
 
     def generate_from_memory(
         self,
@@ -115,9 +123,17 @@ class HypothesisEngine:
             else:
                 h.explanation = h.human_readable()
                 h.seal()
-            self.hypotheses[h.id] = h
             out.append(h)
-        self._save()
+
+        # Gate 12: lock + reload right before merging in the newly
+        # generated hypotheses and saving, so a concurrent writer's
+        # additions aren't clobbered by this call's save.
+        from core.security import locked_json_store
+        with locked_json_store(self.persist_path):
+            self._load()
+            for h in out:
+                self.hypotheses[h.id] = h
+            self._save()
         return out
 
     def _reject_msg(self, why: str) -> str:
@@ -329,24 +345,30 @@ class HypothesisEngine:
             status=HypothesisStatus.REJECTED_EVIDENCE,
             explanation=self._reject_msg(f"ungrounded proposal: {idea[:120]}"),
         )
-        self.hypotheses[h.id] = h
-        self._save()
+        from core.security import locked_json_store
+        with locked_json_store(self.persist_path):
+            self._load()
+            self.hypotheses[h.id] = h
+            self._save()
         return h
 
     def spawn_candidate(self, hypothesis_id: str) -> Strategy:
         """Turn a sealed, evidence-backed hypothesis into a new research Strategy (not a mutation of a frozen one)."""
-        h = self.hypotheses[hypothesis_id]
-        if h.status == HypothesisStatus.REJECTED_EVIDENCE:
-            raise RuntimeError("cannot spawn from rejected hypothesis")
-        if not h.parent_experiments:
-            raise RuntimeError("cannot spawn without parent evidence")
-        if not h.sealed:
-            h.seal()
-        strat = parse_strategy(h.proposed_strategy_spec)
-        h.status = HypothesisStatus.CANDIDATE_SPAWNED
-        h.child_candidate_id = fingerprint_strategy(strat.spec.to_dict())
-        h.lineage.append({"type": "candidate", "id": h.child_candidate_id})
-        self._save()
+        from core.security import locked_json_store
+        with locked_json_store(self.persist_path):
+            self._load()
+            h = self.hypotheses[hypothesis_id]
+            if h.status == HypothesisStatus.REJECTED_EVIDENCE:
+                raise RuntimeError("cannot spawn from rejected hypothesis")
+            if not h.parent_experiments:
+                raise RuntimeError("cannot spawn without parent evidence")
+            if not h.sealed:
+                h.seal()
+            strat = parse_strategy(h.proposed_strategy_spec)
+            h.status = HypothesisStatus.CANDIDATE_SPAWNED
+            h.child_candidate_id = fingerprint_strategy(strat.spec.to_dict())
+            h.lineage.append({"type": "candidate", "id": h.child_candidate_id})
+            self._save()
         return strat
 
     def evaluate_candidate_through_pipeline(
@@ -362,48 +384,54 @@ class HypothesisEngine:
         # use shared memory if possible
         if research.memory is not self.memory and self.memory.all():
             research.memory = self.memory
-        strat = self.spawn_candidate(hypothesis_id)
-        h = self.hypotheses[hypothesis_id]
-        h.status = HypothesisStatus.TESTING
-        exp = research.run_experiment(strat, series, source=f"hypothesis:{hypothesis_id}")
-        h.child_experiment_ids.append(exp.id)
-        h.lineage.append({"type": "experiment", "id": exp.id})
 
-        # falsification vs criteria using OOS vs backtest
-        fc = h.falsification_criteria
-        bt_s = float(exp.backtest.get("sharpe") or 0)
-        oos_s = float(exp.oos.get("sharpe") or bt_s)
-        if bt_s != 0:
-            deg_pct = abs((bt_s - oos_s) / abs(bt_s)) * 100
-        else:
-            deg_pct = 0.0
-        dd_bt = float(exp.backtest.get("max_drawdown") or 0)
-        dd_oos = float(exp.oos.get("max_drawdown") or dd_bt)
-        dd_inc_pct = max(0.0, (dd_oos - dd_bt) * 100)
-        trades = int(exp.backtest.get("trades") or 0)
+        from core.security import locked_json_store
+        with locked_json_store(self.persist_path):
+            # Reentrant: spawn_candidate below acquires this same lock on
+            # this same thread and just re-enters rather than blocking.
+            self._load()
+            strat = self.spawn_candidate(hypothesis_id)
+            h = self.hypotheses[hypothesis_id]
+            h.status = HypothesisStatus.TESTING
+            exp = research.run_experiment(strat, series, source=f"hypothesis:{hypothesis_id}")
+            h.child_experiment_ids.append(exp.id)
+            h.lineage.append({"type": "experiment", "id": exp.id})
 
-        falsified = False
-        reasons = []
-        if deg_pct > fc.max_oos_sharpe_degradation_pct:
-            falsified = True
-            reasons.append(f"OOS Sharpe degradation {deg_pct:.1f}% > {fc.max_oos_sharpe_degradation_pct}%")
-        if dd_inc_pct > fc.max_drawdown_increase_pct:
-            falsified = True
-            reasons.append(f"DD increase {dd_inc_pct:.1f}% > {fc.max_drawdown_increase_pct}%")
-        if trades < fc.min_trades:
-            falsified = True
-            reasons.append(f"trades {trades} < {fc.min_trades}")
-        if exp.disposition in (Disposition.FAILED, Disposition.RETIRED):
-            falsified = True
-            reasons.append("research disposition failed/retired")
+            # falsification vs criteria using OOS vs backtest
+            fc = h.falsification_criteria
+            bt_s = float(exp.backtest.get("sharpe") or 0)
+            oos_s = float(exp.oos.get("sharpe") or bt_s)
+            if bt_s != 0:
+                deg_pct = abs((bt_s - oos_s) / abs(bt_s)) * 100
+            else:
+                deg_pct = 0.0
+            dd_bt = float(exp.backtest.get("max_drawdown") or 0)
+            dd_oos = float(exp.oos.get("max_drawdown") or dd_bt)
+            dd_inc_pct = max(0.0, (dd_oos - dd_bt) * 100)
+            trades = int(exp.backtest.get("trades") or 0)
 
-        if falsified:
-            h.status = HypothesisStatus.FALSIFIED
-            h.lineage.append({"type": "falsified", "id": ";".join(reasons)})
-        else:
-            h.status = HypothesisStatus.SURVIVED
-            h.lineage.append({"type": "survived", "id": exp.id})
-        self._save()
+            falsified = False
+            reasons = []
+            if deg_pct > fc.max_oos_sharpe_degradation_pct:
+                falsified = True
+                reasons.append(f"OOS Sharpe degradation {deg_pct:.1f}% > {fc.max_oos_sharpe_degradation_pct}%")
+            if dd_inc_pct > fc.max_drawdown_increase_pct:
+                falsified = True
+                reasons.append(f"DD increase {dd_inc_pct:.1f}% > {fc.max_drawdown_increase_pct}%")
+            if trades < fc.min_trades:
+                falsified = True
+                reasons.append(f"trades {trades} < {fc.min_trades}")
+            if exp.disposition in (Disposition.FAILED, Disposition.RETIRED):
+                falsified = True
+                reasons.append("research disposition failed/retired")
+
+            if falsified:
+                h.status = HypothesisStatus.FALSIFIED
+                h.lineage.append({"type": "falsified", "id": ";".join(reasons)})
+            else:
+                h.status = HypothesisStatus.SURVIVED
+                h.lineage.append({"type": "survived", "id": exp.id})
+            self._save()
         # ensure experiment notes lineage
         return exp
 

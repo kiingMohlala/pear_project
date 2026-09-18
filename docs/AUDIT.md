@@ -2,15 +2,14 @@
 
 ## PEAR 3.1 — Ownership, Isolation & Concurrency Hardening
 
-**Status: Gates 1-11 complete as of `7ef25ca`; frozen after Gate 10
-(tag `pear-3.1-frozen`, commit `c5b481a`) and independently re-audited a
-second time from a fresh clone of the post-Gate-10 state (`6b6c7b5`),
-again without relying on any prior gate's conclusions, existing tests,
-or reasoning as evidence. Re-Audit 2 found three more confirmed bugs —
-two HIGH, one MEDIUM — sharing Gate 10's exact root cause
-(a `Path.home()`-based default never threaded through per-user scoping)
-but not caught by Gate 10, which was scoped specifically to the browser
-finding rather than the general pattern. Fixed as Gate 11 (`7ef25ca`).**
+**Status: Gates 1-12 complete as of the Gate 12 commit below; frozen
+after Gate 10 (tag `pear-3.1-frozen`, commit `c5b481a`) and independently
+re-audited three times from fresh clones, each time without relying on
+any prior gate's conclusions, existing tests, or reasoning as evidence.
+Re-Audit 2 (against post-Gate-10 `6b6c7b5`) found three bugs sharing
+Gate 10's exact root cause, fixed as Gate 11 (`7ef25ca`). Re-Audit 3
+(against post-Gate-11 `8857c99`) found two more issues not caught by any
+of Gates 1-11 — fixed as Gate 12 below.**
 
 Re-Audit 2's verdict was explicit: **NOT READY**, with two HIGH-severity
 findings (`Workspace`/`DesktopAgent` file access, `CalendarConnector`)
@@ -41,8 +40,9 @@ same standard as Re-Audit 1.
 | **Media (ComputerUseAgent)** | `media/` | Orchestrator/user | Per-user | ✅ (Gate 11 — was 🔴 machine-global; `Orchestrator.media` was already correct, the agent just wasn't using it) |
 | **UI screenshots (ComputerController)** | `ui_captures/` | Orchestrator/user | Per-user | ✅ (Gate 11 — was 🔴 machine-global) |
 | WorkerManager dispatch state | (computed, never written) | n/a | n/a — inert | 🟡 not exploitable today — no I/O occurs at all (Gate 4/5/7 finding, unchanged) |
-| Quant connector research memory | `quant_connector/` | shared, by connector-name only | Ambiguous | 🟡 not evaluated in Gate 11 — flagged, not fixed; Quant is explicitly a shared research system by design, but whether `research_memory.json` records per-query specifics that should be user-scoped hasn't been decided |
-| Raw `copy_file`/`move_file` tool functions | n/a — no storage of their own | n/a | n/a | 🟡 unsafe-by-default (`workspace=None, allow_outside=True` hardcoded) but not reachable from any real request path — `DesktopAgent._process()` only ever calls the guarded `_copy`/`_move`/`_delete` methods. Latent defense-in-depth gap, not fixed in Gate 11. |
+| Quant connector research memory | `quant_connector/` (3 JSON stores: `research_memory.json`, `hypotheses.json`, `quant_review_board.json`) | shared, by connector-name only | Ambiguous | ✅ concurrency-safe (Gate 12 — locked read-modify-write, all 3 stores); 🟡 disclosure still ambiguous — Quant is explicitly a shared research system by design, but free-text fields (`symbol`/`name`) a user supplies are embedded verbatim and readable by every other user, with no in-product disclosure. Deliberately not changed in Gate 12 per "preserve shared design where intentional" — needs a product decision (disclose vs. scrub), not a silent scoping change. |
+| Voice (VoiceAssistant media) | `voice/` | Orchestrator/user | Per-user | ✅ (Gate 12 — was 🔴 machine-global `~/PEAR_Workspace/voice`; not reachable via the HTTP service today — CLI-only — fixed preemptively before it becomes a fourth live incident of the same class) |
+| Raw `copy_file`/`move_file` tool functions | n/a — no storage of their own | n/a | n/a | 🟡 unsafe-by-default (`workspace=None, allow_outside=True` hardcoded) but not reachable from any real request path — `DesktopAgent._process()` only ever calls the guarded `_copy`/`_move`/`_delete` methods. Latent defense-in-depth gap, reconfirmed still present at Re-Audit 3, not fixed in Gate 12 (out of scope — ownership/concurrency only). |
 | AuditLog | `root/audit.jsonl` | server (`PearService` root) | Server-global by design | ✅ — intentional, centralized security log |
 | AuthManager users/sessions | `root/users.json`, `root/sessions.json` | server | Server-global by design | ✅ — intentional, one shared user database |
 | SessionManager data_root | `root/sessions/<user>/...` | server config default | Server-global config, subdivides per-user underneath | ✅ |
@@ -59,17 +59,89 @@ server-wide configuration and are correctly left alone. The problem was
 always specific default parameters silently standing in for that
 injection.
 
-Recommended next step, still not yet done: a **third** independent
-re-audit, fresh, against the Gate-11-frozen state — the same way
-Re-Audit 2 was run against the Gate-10 state. If it finds another
-`Path.home()`-style leak, the right response is to expand the
-architectural rule and sweep the whole codebase against it once, rather
-than opening a Gate 12 for one more isolated component.
+Recommended next step, still not yet done: the repo-wide sweep floated
+after Re-Audit 2 — Re-Audit 3 found a *fourth* independent instance of
+"state/default that assumes single-user" (Voice, on top of Gates 10/11's
+three), plus a genuinely different concurrency-correctness bug (Quant's
+lost-write race) that no amount of `Path.home()`-grepping would have
+caught, since the bug wasn't about *where* the file lived but about
+*how many independently-constructed instances* raced to overwrite it.
+Worth deciding explicitly whether to keep fixing these one at a time as
+they surface, or commit to one deliberate sweep — both for remaining
+`Path.home()`-style defaults and for any other shared-mutable-state
+pattern (module-level singletons, class-level caches) that hasn't been
+audited from the concurrency angle yet.
 
-Status of the (now 11-gate) task card. Each gate is only marked done
+Status of the (now 12-gate) task card. Each gate is only marked done
 once it has a real test that (a) fails against the pre-fix code via
 `git stash` and (b) passes against the fix, run stable across repeated
 full-suite runs — not just "code written."
+
+- 🟢 **Gate 12 — Quant persistence race + Voice ownership.** Fixed
+  against `8857c99`. Found by Re-Audit 3, not by any of Gates 1-11, and
+  not the same root cause as Gates 10/11 in one of the two cases:
+  - **Quant persistence race (new bug class).** All three Quant JSON
+    stores (`research_memory.json`, `hypotheses.json`,
+    `quant_review_board.json`) are constructed fresh per user session
+    (`QuantConnector` has no `data_dir` override, so all sessions share
+    the same file — a deliberate design choice, not the bug). Each
+    instance loaded the whole file into a private in-memory snapshot
+    once at construction, then overwrote the whole file on every save
+    with only what that one instance knew about. Reproduced directly
+    before any code change: 30 threads, each an independently-constructed
+    `ResearchMemory` (mirroring exactly how `Orchestrator` builds one per
+    session), each adding one experiment concurrently — **28 of 30
+    silently vanished**, no exception or log entry anywhere, last writer
+    wins. Fixed with a new `core/security.locked_json_store()` — a
+    thread lock keyed by resolved path plus a best-effort `fcntl.flock`
+    on a sibling `.lock` file for cross-process defense-in-depth,
+    reentrant within one thread's call stack (needed because
+    `HypothesisEngine.evaluate_candidate_through_pipeline` legitimately
+    nests into its own `spawn_candidate`, which also acquires the lock).
+    Every mutator in all three stores now locks, reloads fresh state
+    from disk *additively* (only pulling in ids not already resident in
+    memory — a full replace was tried first and broke object-identity
+    assumptions an existing test relied on: a caller holding a reference
+    to a `Hypothesis` returned earlier needs its later in-place mutations
+    to still be visible), then saves via `atomic_write_text` (the
+    existing Gate 7 crash-safety primitive, previously not used by any
+    of the three quant stores — they used a bare `path.write_text()`).
+    Fixed a genuinely separate pre-existing bug found while touching this
+    code, not invented for the occasion: `ResearchReviewBoard._load()`
+    only ever restored `decisions`, never `scorecards` — every reload
+    silently dropped every scorecard not still sitting in that instance's
+    own memory, which would have made the lock+reload fix a no-op for
+    scorecards specifically. Added `CandidateScorecard.from_dict()`
+    (only `to_dict()` existed) to make that fix possible.
+  - **Voice ownership (same class as Gates 10/11).** `VoiceAssistant`
+    defaulted to `~/PEAR_Workspace/voice` — machine-global — because
+    `Orchestrator.__init__` constructed it without a `media_dir`. Not
+    reachable via the HTTP service today (zero references to `orch.voice`
+    anywhere in `service/app.py`, reconfirmed at Re-Audit 3) — only
+    reachable via `ui/app.py`'s CLI `/voice` commands. Fixed preemptively,
+    the same one-line-of-injection pattern as Gates 10/11: `Orchestrator`
+    now derives `voice_media_dir` from `self.memory.persist_dir`, same as
+    `self.workspace`/`self.media`/`self.browser_manager`. Bare
+    construction with no `persist_dir` at all (the CLI's own bare
+    Orchestrator, `evaluation/engine.py`'s explicit-`media_dir` harness)
+    still falls back to the shared default unchanged — that's the same
+    documented exception Gate 11 established, not a regression.
+  - **Deliberately not changed**, per the standing instruction to
+    preserve intentional shared design: the Quant corpus itself stays
+    shared-by-connector-name; free-text fields a user supplies (Re-Audit
+    3's `symbol`/`name` leak finding) are still embedded verbatim and
+    readable cross-user. That's a disclose-vs-scrub product decision,
+    not an ownership/concurrency bug, and Gate 12 didn't silently resolve
+    it either way.
+  - 5 tests, 4 of 5 confirmed to fail against the pre-fix code via
+    `git stash` (the fifth — bare construction without a `persist_dir`
+    still falling back to the shared home-relative default — correctly
+    passes either way, since Gate 12 didn't change that path; noted
+    honestly rather than claimed as gate-specific proof, same discipline
+    as Gate 11's path-traversal/bare-construction tests). Full suite
+    stable across 3 runs, new concurrency tests specifically repeated 5
+    additional times. Fresh-clone verified: cloned `8857c99` into a clean
+    directory, applied the diff, ran the full suite from there.
 
 - 🟢 **Gate 11 — Per-user filesystem isolation.** Fixed in `7ef25ca`.
   Found by Re-Audit 2, not by any of Gates 1-10: three components each

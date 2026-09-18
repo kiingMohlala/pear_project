@@ -206,7 +206,20 @@ class Orchestrator:
             from pathlib import Path as _P
             # prefer repo plugins/ directory
         self.plugins = PluginManager(self)
-        self.voice = VoiceAssistant(orchestrator=self)
+        # PEAR 3.1 Gate 12: VoiceAssistant previously took no media_dir
+        # here, so it defaulted to the machine-global
+        # ~/PEAR_Workspace/voice for every user — same bug class as the
+        # browser (Gate 10) and workspace/calendar/media (Gate 11)
+        # findings, flagged in the Re-Audit 3 handoff as not yet fixed.
+        # Not currently reachable via the HTTP service (no orch.voice
+        # references in service/app.py), but fixed here preemptively so
+        # it's already safe whenever Voice does get wired into a
+        # multi-user surface, rather than becoming a fourth incident.
+        voice_media_dir = None
+        if getattr(self.memory, "persist_dir", None):
+            from pathlib import Path as _P
+            voice_media_dir = _P(self.memory.persist_dir) / "voice"
+        self.voice = VoiceAssistant(orchestrator=self, media_dir=voice_media_dir)
         self.collaboration = CollaborationManager(self)
         self.goals = GoalManager(self)
         self.learning = LearningEngine(self)

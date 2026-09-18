@@ -90,6 +90,11 @@ class CandidateScorecard:
         self.compute_composite()
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "CandidateScorecard":
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
 
 def rank_scorecards(cards: List[CandidateScorecard]) -> List[CandidateScorecard]:
     for c in cards:

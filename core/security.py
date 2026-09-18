@@ -65,6 +65,96 @@ def atomic_write_text(path: "Path", text: str, encoding: str = "utf-8") -> None:
     atomic_write_bytes(path, text.encode(encoding))
 
 
+# ── PEAR 3.1 Gate 12: locked read-modify-write for shared JSON stores ──
+#
+# atomic_write_bytes (above) prevents a *corrupted* file from a crash
+# mid-write. It does nothing for a *lost* write: several stores (the
+# Quant connector's research_memory.json/hypotheses.json/review_board.json
+# in particular) are constructed fresh per user session, each loading the
+# whole file into a private in-memory dict once at construction, then
+# overwriting the whole file with only what that one instance knows about.
+# Re-Audit 3 reproduced this directly: 30 concurrent callers each added
+# one experiment to the shared corpus, and only 2 of 30 survived on disk
+# — the rest were silently clobbered by whichever writer saved last, with
+# no exception or log entry anywhere.
+#
+# locked_json_store serializes the full read-modify-write cycle for a
+# given path: a threading.Lock keyed by the resolved path (covers the
+# in-process multi-threaded case this app actually runs under —
+# ThreadingHTTPServer / uvicorn single-worker), plus a best-effort
+# fcntl.flock on a sibling `.lock` file for defense-in-depth if this ever
+# runs multi-process. Callers must reload from disk *inside* the `with`
+# block before mutating, so every writer starts from the latest committed
+# state rather than a stale snapshot taken at construction time.
+import threading as _threading
+from contextlib import contextmanager as _contextmanager
+
+_STORE_LOCKS: Dict[str, "_threading.Lock"] = {}
+_STORE_LOCKS_GUARD = _threading.Lock()
+_HELD_BY_THIS_THREAD = _threading.local()
+
+
+def _store_lock_for(path: "Path") -> "_threading.Lock":
+    key = str(Path(path).resolve())
+    with _STORE_LOCKS_GUARD:
+        lock = _STORE_LOCKS.get(key)
+        if lock is None:
+            lock = _threading.Lock()
+            _STORE_LOCKS[key] = lock
+        return lock
+
+
+@_contextmanager
+def locked_json_store(path: "Path"):
+    """
+    Hold this for an entire load-mutate-save cycle against `path`.
+
+    Reentrant *within the same thread*: some callers (e.g.
+    HypothesisEngine.evaluate_candidate_through_pipeline calling its own
+    spawn_candidate) legitimately nest calls against the same persist
+    path on one call stack. A plain lock — thread or fcntl — would
+    self-deadlock on the second, inner acquisition, so a thread that
+    already holds this path's lock just re-enters without blocking.
+    Cross-thread and cross-process callers still fully serialize.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = str(path.resolve())
+    held = getattr(_HELD_BY_THIS_THREAD, "paths", None)
+    if held is None:
+        held = set()
+        _HELD_BY_THIS_THREAD.paths = held
+
+    if key in held:
+        # Already holding this path's lock further up this same
+        # thread's call stack — re-entering, not a new acquisition.
+        yield
+        return
+
+    lock_path = path.parent / f".{path.name}.lock"
+    thread_lock = _store_lock_for(path)
+    with thread_lock:
+        held.add(key)
+        lf = None
+        try:
+            lf = open(lock_path, "a+")
+            try:
+                import fcntl
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass  # non-POSIX, or fcntl unavailable — thread lock still holds
+            yield
+        finally:
+            held.discard(key)
+            if lf is not None:
+                try:
+                    import fcntl
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                lf.close()
+
+
 def safe_load_text(path: "Path", *, on_corrupt_label: str = "store") -> Optional[str]:
     """
     Returns the file's text, or None if it doesn't exist (normal — caller
