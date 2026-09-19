@@ -651,7 +651,20 @@ def create_app(data_root: Optional[Path] = None):
     def chat(payload: dict, authorization: Optional[str] = Header(None)):
         user = user_dep(authorization)
         orch = service.sessions.get(user.username).orchestrator
-        result = service.do_chat(orch, payload.get("message") or "")
+        # PEAR 3.2 Task 013: activate this user's tracer for the duration
+        # of the actual work, covering the success, exception, and
+        # early-return paths alike via try/finally — see the matching
+        # note on chat_stream below for why an explicit reset is required
+        # here (unlike _dispatch's stdlib path, FastAPI/Starlette's
+        # threadpool for sync path operations reuses OS threads across
+        # requests, so a contextvar left set would leak into the next
+        # unrelated request that happens to land on the same thread).
+        from core.tracing import set_tracer, reset_tracer
+        _token = set_tracer(orch.tracer)
+        try:
+            result = service.do_chat(orch, payload.get("message") or "")
+        finally:
+            reset_tracer(_token)
         return {"ok": True, "result": result}
 
     @app.post("/v1/chat/stream")
@@ -661,8 +674,20 @@ def create_app(data_root: Optional[Path] = None):
         message = payload.get("message") or ""
 
         def gen():
-            chunks = []
-            result = service.do_chat(orch, message, on_token=lambda t: chunks.append(t))
+            # PEAR 3.2 Task 013: the actual agent/tool/LLM work (and every
+            # span it creates via get_tracer()) happens here, when
+            # Starlette iterates this generator to produce the SSE
+            # response -- not necessarily on the same call stack as
+            # chat_stream() itself -- so the tracer has to be activated
+            # and reset around this body specifically, not around the
+            # outer route function.
+            from core.tracing import set_tracer, reset_tracer
+            _token = set_tracer(orch.tracer)
+            try:
+                chunks = []
+                result = service.do_chat(orch, message, on_token=lambda t: chunks.append(t))
+            finally:
+                reset_tracer(_token)
             text = result.get("reply") or ""
             parts = chunks or [text[i:i+32] for i in range(0, len(text), 32)]
             for p in parts:
@@ -675,29 +700,42 @@ def create_app(data_root: Optional[Path] = None):
     def list_goals(authorization: Optional[str] = Header(None)):
         user = user_dep(authorization)
         orch = service.sessions.get(user.username).orchestrator
-        return {"ok": True, "goals": [g.to_dict() for g in orch.goals.list_goals()]}
+        from core.tracing import set_tracer, reset_tracer
+        _token = set_tracer(orch.tracer)
+        try:
+            goals = [g.to_dict() for g in orch.goals.list_goals()]
+        finally:
+            reset_tracer(_token)
+        return {"ok": True, "goals": goals}
 
     @app.get("/v1/agents")
     def list_agents(authorization: Optional[str] = Header(None)):
         user = user_dep(authorization)
         orch = service.sessions.get(user.username).orchestrator
-        return {
-            "ok": True,
-            "agents": [
+        from core.tracing import set_tracer, reset_tracer
+        _token = set_tracer(orch.tracer)
+        try:
+            agents = [
                 {"name": n, "description": getattr(a, "description", ""), "capabilities": list(getattr(a, "capabilities", []))}
                 for n, a in getattr(orch, "agents", {}).items()
-            ],
-        }
+            ]
+        finally:
+            reset_tracer(_token)
+        return {"ok": True, "agents": agents}
 
     @app.get("/v1/recommendations")
     def recommendations(authorization: Optional[str] = Header(None)):
         user = user_dep(authorization)
         orch = service.sessions.get(user.username).orchestrator
+        from core.tracing import set_tracer, reset_tracer
+        _token = set_tracer(orch.tracer)
         try:
             orch.learning.analyze()
             recs = orch.learning.list_recommendations()
         except Exception:
             recs = []
+        finally:
+            reset_tracer(_token)
         return {"ok": True, "recommendations": recs}
 
     return app

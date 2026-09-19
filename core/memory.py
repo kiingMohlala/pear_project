@@ -601,32 +601,50 @@ class Memory:
         path = self._path()
         if not path:
             return
-        data = {
-            "session_id": self.session_id,
-            "working": [m.to_dict() for m in self.working.messages],
-            "long_term": {
-                "preferences": self.long_term.preferences,
-                "facts": self.long_term.facts,
-            },
-            "knowledge": {
-                "notes": self.knowledge.notes,
-                # Store document metadata only (full text can be large)
-                "documents": [
-                    {k: v for k, v in d.items() if k != "text"} | {"text_length": len(d.get("text", ""))}
-                    for d in self.knowledge.documents
-                ],
-                # Keep full text of the most recent doc for summarization
-                "latest_doc_text": (
-                    self.knowledge.documents[-1]["text"]
-                    if self.knowledge.documents else None
-                ),
-                "latest_doc_name": (
-                    self.knowledge.documents[-1]["name"]
-                    if self.knowledge.documents else None
-                ),
-            },
-        }
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # PEAR 3.2 Task 013: reproduced directly (not pattern-matched) —
+        # concurrent same-user requests calling _save() on this one
+        # shared Memory instance can interleave two write_text() calls on
+        # the same path, producing either a torn/invalid JSON file or a
+        # save that silently loses another thread's already-in-memory
+        # data (repro: 4/15 trials failed at 50 concurrent threads with
+        # no lock). No reload-from-disk is needed the way Gate 12 needed
+        # it for Quant — this is one long-lived shared instance, not
+        # reconstructed per session, so there's no stale-disk-snapshot
+        # problem. But the in-memory `data` snapshot itself must be built
+        # *inside* the lock, not before it: build-then-acquire lets two
+        # threads race to acquire the lock with snapshots taken at
+        # different times, and whichever snapshot loses that race can be
+        # older than the other, silently overwriting a more complete
+        # write with a stale one even though both threads' mutations
+        # already landed in the shared in-memory object.
+        from core.security import locked_json_store, atomic_write_text
+        with locked_json_store(path):
+            data = {
+                "session_id": self.session_id,
+                "working": [m.to_dict() for m in self.working.messages],
+                "long_term": {
+                    "preferences": self.long_term.preferences,
+                    "facts": self.long_term.facts,
+                },
+                "knowledge": {
+                    "notes": self.knowledge.notes,
+                    # Store document metadata only (full text can be large)
+                    "documents": [
+                        {k: v for k, v in d.items() if k != "text"} | {"text_length": len(d.get("text", ""))}
+                        for d in self.knowledge.documents
+                    ],
+                    # Keep full text of the most recent doc for summarization
+                    "latest_doc_text": (
+                        self.knowledge.documents[-1]["text"]
+                        if self.knowledge.documents else None
+                    ),
+                    "latest_doc_name": (
+                        self.knowledge.documents[-1]["name"]
+                        if self.knowledge.documents else None
+                    ),
+                },
+            }
+            atomic_write_text(path, json.dumps(data, indent=2))
 
     def _load(self) -> None:
         path = self._path()

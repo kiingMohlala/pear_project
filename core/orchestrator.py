@@ -236,9 +236,30 @@ class Orchestrator:
             per_minute=int(_cfg.get("rate_limit_per_minute", 120)),
             burst=int(_cfg.get("rate_limit_burst", 30)),
         )
+        # PEAR 3.2 Task 013: previously derived from the global
+        # _cfg["data_dir"] (~/.pear — the multi-user root every
+        # SessionManager-built session sits under), so any user's
+        # orch.backups.create() would zip up EVERY user's session
+        # directory, users.json, and the shared audit log into one
+        # archive. Now scoped to this Orchestrator's own
+        # self.memory.persist_dir, same as goals/learning/workers/
+        # workspace/calendar/browser/computer-use/voice already are —
+        # both what gets backed up (data_dir) and where the archive
+        # itself is written (backup_dir), so one user can't even see
+        # another's backup filenames via list_backups(). The CLI's own
+        # single-operator Orchestrator (ui/app.py) uses a dedicated
+        # persist_dir (ROOT/"data") that was never inside ~/.pear to
+        # begin with, so this doesn't change its behavior at all —
+        # only SessionManager-built, multi-tenant orchestrators were
+        # ever actually affected by the bug being fixed here.
+        backup_data_dir = Path(str(_cfg.get("data_dir")))
+        backup_dir = Path(str(_cfg.get("backup_dir")))
+        if getattr(self.memory, "persist_dir", None):
+            backup_data_dir = Path(self.memory.persist_dir)
+            backup_dir = backup_data_dir / "backups"
         self.backups = BackupManager(
-            Path(str(_cfg.get("data_dir"))),
-            backup_dir=Path(str(_cfg.get("backup_dir"))),
+            backup_data_dir,
+            backup_dir=backup_dir,
         )
         self.memory_intel = getattr(self.memory, "intelligence", None) or MemoryIntelligence(self.memory)
         if getattr(self.memory, "intelligence", None) is None:

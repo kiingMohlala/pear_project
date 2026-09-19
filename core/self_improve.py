@@ -120,15 +120,21 @@ class SelfImprovementEngine:
         return self.persist_dir / "rsi_state.json"
 
     def _save(self) -> None:
-        data = {
-            "proposals": [p.to_dict() for p in self.proposals.values()],
-            "baselines": self.baselines,
-            "history": self.history[-300:],
-            "active_changes": self._active_changes,
-            "prior_snapshot": self._prior_snapshot,
-            "require_human_approval": self.require_human_approval,
-        }
-        self._path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # PEAR 3.2 Task 013: same reproduced same-instance concurrent-
+        # write race as Memory/Learning, same fix — snapshot built inside
+        # the lock so the last writer is always the most complete one.
+        from core.security import locked_json_store, atomic_write_text
+        path = self._path()
+        with locked_json_store(path):
+            data = {
+                "proposals": [p.to_dict() for p in self.proposals.values()],
+                "baselines": self.baselines,
+                "history": self.history[-300:],
+                "active_changes": self._active_changes,
+                "prior_snapshot": self._prior_snapshot,
+                "require_human_approval": self.require_human_approval,
+            }
+            atomic_write_text(path, json.dumps(data, indent=2))
 
     def _load(self) -> None:
         p = self._path()

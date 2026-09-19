@@ -67,15 +67,21 @@ class LearningEngine:
         return self.persist_dir / "learning_state.json"
 
     def _save(self) -> None:
-        data = {
-            "recommendations": [r.to_dict() for r in self.recommendations[-200:]],
-            "history": self.history[-200:],
-            "routing_stats": dict(self.routing_stats),
-            "collab_stats": dict(self.collab_stats),
-            "workflow_step_stats": dict(self.workflow_step_stats),
-            "retrieval_feedback": dict(self.retrieval_feedback),
-        }
-        self._state_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # PEAR 3.2 Task 013: same reproduced same-instance concurrent-
+        # write race as Memory._save(), same fix — lock first, build the
+        # snapshot inside the lock (not before it), write atomically.
+        from core.security import locked_json_store, atomic_write_text
+        path = self._state_path()
+        with locked_json_store(path):
+            data = {
+                "recommendations": [r.to_dict() for r in self.recommendations[-200:]],
+                "history": self.history[-200:],
+                "routing_stats": dict(self.routing_stats),
+                "collab_stats": dict(self.collab_stats),
+                "workflow_step_stats": dict(self.workflow_step_stats),
+                "retrieval_feedback": dict(self.retrieval_feedback),
+            }
+            atomic_write_text(path, json.dumps(data, indent=2))
 
     def _load(self) -> None:
         p = self._state_path()
