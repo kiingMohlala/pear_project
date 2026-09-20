@@ -162,10 +162,13 @@ class PluginManager:
     def enable(self, name: str) -> str:
         rec = self._require(name)
         rec.enabled = True
-        self._state.setdefault("enabled", {})[name] = True
-        if name in self._state.get("disabled", []):
-            self._state["disabled"].remove(name)
-        self._save_state()
+
+        def _mutate():
+            self._state.setdefault("enabled", {})[name] = True
+            if name in self._state.get("disabled", []):
+                self._state["disabled"].remove(name)
+
+        self._locked_mutate_state(_mutate)
         if not rec.loaded:
             self._load_one(rec)
         elif rec.instance:
@@ -179,11 +182,14 @@ class PluginManager:
             api = PluginAPI(self.orch, rec.manifest)
             rec.instance.disable(api)
         rec.enabled = False
-        self._state.setdefault("enabled", {})[name] = False
-        self._state.setdefault("disabled", [])
-        if name not in self._state["disabled"]:
-            self._state["disabled"].append(name)
-        self._save_state()
+
+        def _mutate():
+            self._state.setdefault("enabled", {})[name] = False
+            self._state.setdefault("disabled", [])
+            if name not in self._state["disabled"]:
+                self._state["disabled"].append(name)
+
+        self._locked_mutate_state(_mutate)
         self._emit("plugin_disabled", name)
         return f"disabled {name}"
 
@@ -198,8 +204,7 @@ class PluginManager:
         rec.enabled = False
         rec.loaded = False
         # remove state; do not delete files automatically for safety
-        self._state.get("enabled", {}).pop(name, None)
-        self._save_state()
+        self._locked_mutate_state(lambda: self._state.get("enabled", {}).pop(name, None))
         return f"uninstalled {name} (files retained at {rec.path})"
 
     def info(self, name: str) -> Dict[str, Any]:
@@ -266,7 +271,41 @@ class PluginManager:
 
     def _save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
+        from core.security import atomic_write_text
+        atomic_write_text(self.state_path, json.dumps(self._state, indent=2))
+
+    def _locked_mutate_state(self, mutate) -> None:
+        """
+        PEAR 3.2 Task 016: root cause was NOT the same shape as Calendar's
+        (Task 015) or Memory/Learning/SelfImprovement's (Task 013).
+        Those three are all genuinely one-instance-per-file: each user's
+        own persist_dir, one long-lived instance per user, so a lock
+        alone (no reload) was correct there -- there's only ever one
+        in-memory copy of the data, so nothing can go stale.
+        PluginManager is different: `Orchestrator.__init__` constructs
+        `PluginManager(self)` with no override anywhere in the codebase
+        (confirmed by grep), so `state_path` always defaults to the
+        repo-relative `plugins/.state.json` -- the SAME file for every
+        single user's Orchestrator. That means multiple independently-
+        constructed PluginManager instances (one per user session) can
+        share one file, each with its OWN private `self._state` loaded
+        once at construction -- the exact Gate 12 Quant failure shape,
+        not the Task 013/015 one. A lock alone would still let a stale
+        instance's snapshot silently overwrite a fresher save from a
+        different user's instance. So this reloads `_state` fresh from
+        disk *inside* the lock, applies just this call's specific
+        mutation on top of that fresh state, then writes atomically --
+        Gate 12's reload-before-write pattern, not Task 013/015's
+        simpler lock-only one. `_state`'s values (plain dicts/lists of
+        strings and booleans) have no object-identity-preservation
+        concern the way Hypothesis objects did in Gate 12, so a full
+        reload (not an additive merge) is correct and simpler here.
+        """
+        from core.security import locked_json_store
+        with locked_json_store(self.state_path):
+            self._load_state()
+            mutate()
+            self._save_state()
 
     def _require(self, name: str) -> PluginRecord:
         if name not in self.plugins:

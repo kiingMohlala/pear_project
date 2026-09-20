@@ -32,7 +32,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.connectors.calendar_connector import CalendarConnector
-from core.plugins.manager import PluginManager
 
 
 # ── Calendar: concurrent event creation ─────────────────────────────
@@ -157,53 +156,10 @@ def test_calendar_store_path_stays_per_user():
         assert bob_titles == {"BOB_ONLY_EVENT"}
         assert str(alice.store_path) != str(bob.store_path)
 
+# PluginManager's confirmed race (investigated and reproduced here in
+# Task 015 but deliberately not fixed) was remediated in Task 016 --
+# see tests/test_task016_plugin_manager.py for its regression coverage.
+# The xfail marker that used to live in this file has been removed:
+# per Task 016's Phase 3 instruction, it's replaced by that file's
+# normal passing tests, not kept here as a stale duplicate.
 
-# ── PluginManager: investigated, reproduced, NOT fixed this task ────
-
-class _FakeOrch:
-    def __init__(self):
-        self.memory = type("M", (), {"persist_dir": None})()
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "PEAR 3.2 Task 015 Phase 1: PluginManager._save_state() has the "
-        "same unlocked bare-write_text() race as pre-fix Calendar -- "
-        "CONFIRMED_BUG by reproduction (corrupted JSON in 3/10 trials "
-        "at 50 concurrent ops), but fixing it was out of this task's "
-        "authorized scope (Calendar remediation only). This test is a "
-        "permanent marker: it currently fails (torn/short JSON in at "
-        "least one of several trials, as expected from an unlocked "
-        "race) as expected. If a future task fixes PluginManager, this "
-        "test will XPASS and must be updated/removed then, not before."
-    ),
-)
-def test_pluginmanager_concurrent_state_save_currently_races():
-    # The race is probabilistic (observed ~30% failure rate per trial
-    # at 50 concurrent ops), so this runs several trials and requires
-    # every one to be clean to "pass" -- matching the manual
-    # investigation's own methodology (10 trials) rather than relying
-    # on a single roll that could get lucky and mask the confirmed bug.
-    N = 50
-    for _trial in range(10):
-        with tempfile.TemporaryDirectory() as td:
-            pm = PluginManager(
-                _FakeOrch(),
-                plugins_dir=Path(td) / "plugins",
-                state_path=Path(td) / "plugins" / ".state.json",
-            )
-
-            def worker(i):
-                pm._state.setdefault("enabled", {})[f"plugin-{i}"] = True
-                pm._save_state()
-
-            threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=15)
-
-            raw = pm.state_path.read_text(encoding="utf-8")
-            data = json.loads(raw)  # expected to raise on torn JSON, some trial
-            assert len(data.get("enabled", {})) == N  # expected short, some trial
