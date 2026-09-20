@@ -19,6 +19,37 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def zf_names_excluding_manifest(backup_path: Path) -> List[str]:
+    with zipfile.ZipFile(backup_path, "r") as zf:
+        return [n for n in zf.namelist() if n != "MANIFEST.json"]
+
+
+def _unsafe_member_reason(name: str) -> Optional[str]:
+    """
+    First-line string filter for an archive member name, ahead of the
+    authoritative resolve()-based containment check in restore() --
+    this alone is not the security boundary (a name can look "safe" as
+    a string and still resolve outside target through a pre-existing
+    symlink in the destination tree), but it gives a clear, specific
+    rejection reason for the common attack shapes rather than a bare
+    "resolves outside target" for everything.
+    """
+    if not name:
+        return "empty entry name"
+    if "\x00" in name:
+        return "embedded NUL byte"
+    if "\\" in name:
+        return "backslash in entry name (Windows-style separator/traversal)"
+    if ":" in name:
+        return "colon in entry name (drive-qualified path)"
+    if name.startswith("/"):
+        return "absolute path"
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return "'..' path traversal component"
+    return None
+
+
 class BackupManager:
     def __init__(self, data_dir: Path, backup_dir: Optional[Path] = None):
         self.data_dir = Path(data_dir)
@@ -111,12 +142,64 @@ class BackupManager:
         if dry_run:
             return {"ok": True, "dry_run": True, "target": str(target), "verify": ver}
         target.mkdir(parents=True, exist_ok=True)
+        # PEAR 3.2 Task 017: destinations were previously built as
+        # `target / name` straight from zf.namelist(), with no
+        # containment check at all -- a crafted entry like
+        # "../outside_marker.txt" would extract outside `target`
+        # (reproduced independently before this fix: a real file was
+        # written outside a sandboxed target directory this way).
+        # Every entry is now validated *before any extraction begins*
+        # (Phase 1: "avoid partially extracting unsafe archives" --
+        # the whole restore is rejected up front rather than silently
+        # skipping unsafe members mixed in with safe ones, which would
+        # otherwise leave the caller unsure how much of the backup
+        # actually landed). Containment is checked by resolving the
+        # real, symlink-following filesystem path of each computed
+        # destination and requiring it stay inside the resolved target
+        # root -- not by string-prefix comparison on the unresolved
+        # path, which a symlink already present in the target tree (not
+        # necessarily one created by this archive -- this
+        # implementation only ever copies file bytes, never recreates
+        # an actual symlink from a zip entry, so a *malicious entry*
+        # can't plant one for a later entry to walk through, but a
+        # *pre-existing* symlink under `target` from anywhere else
+        # could still redirect an otherwise-innocent-looking entry) or
+        # a "safe-looking" `..`-free string could still bypass.
+        target_root = target.resolve()
+        safe_members: List[tuple] = []  # (name, resolved_dest, is_dir_marker)
+        rejected: List[Dict[str, str]] = []
+        for name in zf_names_excluding_manifest(backup_path):
+            reason = _unsafe_member_reason(name)
+            if reason:
+                rejected.append({"name": name, "reason": reason})
+                continue
+            is_dir_marker = name.endswith("/")
+            dest = target / name
+            try:
+                resolved = dest.resolve()
+            except (OSError, RuntimeError) as e:
+                rejected.append({"name": name, "reason": f"could not resolve destination: {e}"})
+                continue
+            if resolved != target_root and target_root not in resolved.parents:
+                rejected.append({"name": name, "reason": "resolves outside target directory"})
+                continue
+            safe_members.append((name, resolved, is_dir_marker))
+
+        if rejected:
+            return {
+                "ok": False,
+                "error": "unsafe archive: rejected before any extraction",
+                "target": str(target),
+                "verify": ver,
+                "rejected_entries": rejected,
+            }
+
         with zipfile.ZipFile(backup_path, "r") as zf:
-            for name in zf.namelist():
-                if name == "MANIFEST.json":
+            for name, resolved, is_dir_marker in safe_members:
+                if is_dir_marker:
+                    resolved.mkdir(parents=True, exist_ok=True)
                     continue
-                dest = target / name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(name) as src, dest.open("wb") as out:
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(name) as src, resolved.open("wb") as out:
                     shutil.copyfileobj(src, out)
         return {"ok": True, "target": str(target), "verify": ver}

@@ -11,6 +11,11 @@ data/
 # silently dropped plugins/*/plugin.json (source, should be tracked) along
 # with the genuinely local files below. Keep this list specific.
 plugins/**/.state.json
+# PEAR 3.2 Task 016/017: locked_json_store (core/security.py) creates a
+# sibling `.lock` coordination file next to the state file it guards —
+# runtime-only, never has meaningful content, same reasoning as the
+# .state.json rule above.
+plugins/**/..state.json.lock
 /users.json
 .DS_Store
 .idea/
