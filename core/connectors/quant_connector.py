@@ -5,6 +5,25 @@ Hard boundary:
   PEAR may call research / reports / hypotheses / shadow *status*
   PEAR must NEVER place real orders, allocate capital, or mutate frozen candidates.
   No broker trading credentials are accepted or stored.
+
+Data-sharing disclosure (PEAR 3.2 Task 018):
+  The research corpus this connector reads and writes (experiments,
+  hypotheses, review decisions) is a SHARED resource across every user
+  with quant access, by design -- not a private, per-user store. There
+  is no per-user ownership concept anywhere in this data model; any
+  value passed as `name`/`family` or `symbol`/`market` to quant_research
+  or quant_review is stored verbatim and is readable by every other
+  user via quant_candidates/quant_status/quant_market_summary. `name`/
+  `family`/`symbol`/`market` are validated (quant.dsl.
+  validate_shared_identifier) to reject the worst cases -- embedded
+  control characters, free-text sentences, excessive length -- but that
+  validation cannot and does not distinguish a genuine market symbol or
+  strategy name from a short, identifier-shaped label a caller chooses
+  to submit instead (verified directly during Task 018: the exact
+  reproduction string from Re-Audit 3 still passes). Callers must treat
+  every field submitted here as visible to every other quant user --
+  never pass anything through `name`/`family`/`symbol`/`market` that
+  isn't meant to be shared.
 """
 
 from __future__ import annotations
@@ -163,13 +182,20 @@ class QuantConnector(Connector):
         params: family/name, fast, slow, symbol, n_bars, seed
         For long runs, PEAR should wrap this in a Job.
         """
-        from quant.dsl import parse_strategy
+        from quant.dsl import parse_strategy, validate_shared_identifier
         from quant.data import synthetic_ohlcv
 
-        name = str(params.get("name") or params.get("family") or "sma_cross")
+        try:
+            name = validate_shared_identifier(
+                params.get("name") or params.get("family") or "sma_cross", "name"
+            )
+            symbol = validate_shared_identifier(
+                params.get("symbol") or params.get("market") or "SYN", "symbol"
+            )
+        except ValueError as e:
+            return ConnectorResult(ok=False, error=str(e))
         fast = float(params.get("fast") or 5)
         slow = float(params.get("slow") or 20)
-        symbol = str(params.get("symbol") or params.get("market") or "SYN")
         n = int(params.get("n_bars") or 200)
         seed = int(params.get("seed") or 1)
         strat = parse_strategy({"name": name, "params": {"fast": fast, "slow": slow}})
@@ -250,10 +276,13 @@ class QuantConnector(Connector):
         )
 
     def _review(self, **params) -> ConnectorResult:
-        from quant.dsl import parse_strategy
+        from quant.dsl import parse_strategy, validate_shared_identifier
         from quant.data import synthetic_ohlcv
 
-        name = str(params.get("name") or "sma_cross")
+        try:
+            name = validate_shared_identifier(params.get("name") or "sma_cross", "name")
+        except ValueError as e:
+            return ConnectorResult(ok=False, error=str(e))
         fast = float(params.get("fast") or 5)
         slow = float(params.get("slow") or 20)
         strat = parse_strategy({"name": name, "params": {"fast": fast, "slow": slow}})

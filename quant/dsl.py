@@ -15,12 +15,60 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
 
 ALLOWED_ENTRY = {"cross_above", "cross_below", "above", "below", "always"}
 ALLOWED_EXIT = {"cross_above", "cross_below", "above", "below", "opposite", "hold"}
+
+# PEAR 3.2 Task 018: quant_research/quant_review accept `name`/`family`
+# and (validated at its own call site in
+# core/connectors/quant_connector.py) `symbol`/`market` as free text
+# with no validation anywhere. QuantConnector's research corpus
+# (research_memory.json, hypotheses.json, review_board.json) is
+# genuinely shared across every user by design -- ExperimentRecord and
+# Hypothesis have no user-identity field at all, and that's intentional
+# (the corpus's whole value is aggregate, cross-session research
+# results).
+#
+# What this validator actually does, stated honestly rather than
+# overclaimed: it rejects the *worst* cases outright -- embedded NUL
+# bytes, multi-word sentences (spaces are allowed for names like "S&P
+# 500" but a long free-text message reads very differently from a
+# short identifier), excessive length, and non-identifier punctuation.
+# It does NOT, and structurally cannot, distinguish a real market
+# symbol from a short, identifier-shaped secret someone chooses to
+# submit instead: "ALICE_PRIVATE_PORTFOLIO_XYZ" is syntactically
+# indistinguishable from "BTCUSDT" or "sma_cross_v2" -- any charset
+# permissive enough to accept legitimate tickers and strategy names is
+# also permissive enough to accept a short underscore-separated label
+# someone chose to use as a message instead. Verified directly: the
+# exact string from the original Re-Audit 3 reproduction still passes
+# this validator unchanged. The max length here (24, tightened from an
+# initial, too-generous 40 during this task after that reproduction
+# showed 40 chars is plenty of "bandwidth" for a short private note)
+# reduces how much can be smuggled this way, it does not eliminate it.
+# Closing that residual gap is a disclosure decision, not a validation
+# one -- see the docstring on QuantConnector below and this task's
+# final report for the reasoning.
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._\-/ ]{0,22}[A-Za-z0-9])?$")
+
+
+
+def validate_shared_identifier(value: Any, field_name: str, max_len: int = 24) -> str:
+    v = str(value if value is not None else "").strip()
+    if not v:
+        raise ValueError(f"{field_name} must not be empty")
+    if len(v) > max_len:
+        raise ValueError(f"{field_name} exceeds {max_len} characters")
+    if not _IDENTIFIER_RE.match(v):
+        raise ValueError(
+            f"{field_name} must look like a market/strategy identifier "
+            f"(letters, digits, '.', '_', '-', '/', spaces only) -- got {v!r}"
+        )
+    return v
 
 
 @dataclass
