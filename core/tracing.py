@@ -438,6 +438,12 @@ _tracer_ctx: "contextvars.ContextVar[Optional[Tracer]]" = contextvars.ContextVar
     "pear_current_tracer", default=None
 )
 # Fallback only for contexts with no active per-user tracer (bare scripts, tests).
+# PEAR 3.2 Task 019: also the real destination for Orchestrator.__init__'s
+# construction-time plugin-load spans, since those run before this
+# Orchestrator's own tracer is activated via set_tracer(). Investigated
+# and classified as safe system telemetry -- see core/orchestrator.py's
+# self.plugins.load_all() call site, core/plugins/manager.py's
+# _load_one(), and tests/test_task019_construction_tracer.py.
 _fallback_tracer: Optional[Tracer] = None
 
 

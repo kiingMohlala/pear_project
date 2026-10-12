@@ -123,6 +123,17 @@ class PluginManager:
         return results
 
     def _load_one(self, rec: PluginRecord) -> None:
+        # PEAR 3.2 Task 019: when this runs during Orchestrator.__init__
+        # (via load_all(), called before that Orchestrator's own tracer is
+        # ever activated for the current thread), get_tracer() resolves to
+        # the shared process-wide fallback tracer rather than a per-user
+        # one. Investigated and classified as safe: this span's content
+        # (plugin name only, see below) carries nothing user-specific, and
+        # there's no reachable read path for the fallback tracer's content
+        # on either HTTP surface. See core/orchestrator.py's
+        # self.plugins.load_all() call site and
+        # tests/test_task019_construction_tracer.py for the full
+        # reasoning and the regression coverage that keeps it true.
         try:
             from ..tracing import get_tracer
             span_cm = get_tracer().span(

@@ -267,6 +267,28 @@ class Orchestrator:
         else:
             self.memory_intel = self.memory.intelligence
             self.memory_intel.attach(self.memory)
+        # PEAR 3.2 Task 019: this runs before set_tracer(self.tracer) is
+        # ever called for this Orchestrator (that only happens later, at
+        # route() -- see the Gate 1 comment there), so any get_tracer()
+        # call triggered from inside load_all() resolves to the shared
+        # process-wide fallback tracer, not self.tracer. Investigated and
+        # decided (not silently accepted): PluginManager._load_one() is
+        # the only construction-time code path anywhere in __init__ that
+        # creates a real tracer span (core/workers.py's construction-time
+        # activity only reads empty context_ids() for event-stamping,
+        # which writes nothing). Reproduced directly across concurrent
+        # multi-user construction on both HTTP surfaces: the resulting
+        # spans are named "plugin.load.<plugin_name>" with a `plugin`
+        # attribute only -- no user_id, session_id, persist_dir, or any
+        # other per-user content ever appears in them, and each user's
+        # construction lands in its own separate orphan trace rather than
+        # merging into another user's. There is also no reachable read
+        # path for this content on either surface (stdlib's /v1/traces
+        # reads self.tracer, the per-user object, never the fallback;
+        # FastAPI has no equivalent route at all). Classified as safe
+        # bootstrap/system telemetry -- see
+        # tests/test_task019_construction_tracer.py for the regression
+        # coverage that keeps this property true rather than assumed.
         try:
             self.plugins.load_all()
         except Exception:
