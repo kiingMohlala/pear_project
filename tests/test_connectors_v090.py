@@ -32,7 +32,7 @@ def test_registry_lists_reference_connectors():
 
 def test_local_files_connect_and_list():
     with tempfile.TemporaryDirectory() as td:
-        ws = Workspace(roots=[Path(td)])
+        ws = Workspace(roots=[Path(td)], boundary=Path(td))
         reg = build_default_connectors(workspace=ws)
         r = reg.connect("local_files")
         assert r.ok

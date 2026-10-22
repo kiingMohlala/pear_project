@@ -431,7 +431,7 @@ def _suite_desktop(engine: EvaluationEngine) -> SuiteReport:
 
     suite = SuiteReport(name="desktop")
     with tempfile.TemporaryDirectory() as td:
-        ws = Workspace(roots=[Path(td)])
+        ws = Workspace(roots=[Path(td)], boundary=Path(td))
         agent = DesktopAgent(workspace=ws)
         agent.memory = Memory(session_id="eval_desk")
         r, ms = _timed(lambda: agent.think("create folder eval_box"))

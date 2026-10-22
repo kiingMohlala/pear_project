@@ -55,10 +55,40 @@ class Workspace:
     ad-hoc scripts) falls back to the machine-global default
     ~/PEAR_Workspace — that's fine for a single-user context, but must
     never be what a multi-user service path silently gets.
+
+    PEAR 3.2 Task 021: `add_root()` previously accepted *any* resolved
+    path with zero validation -- any user could call the documented
+    `workspace add <path>` command (reachable via ordinary, unforced
+    chat routing, not just internal API calls -- confirmed directly in
+    Task 020) to add another user's workspace, or a system directory,
+    to their own sandbox, after which every other already-correctly-
+    bounded operation (copy/move/delete/list, all gated by
+    require_inside(self.roots)) would legitimately treat it as safe.
+    `boundary` fixes the actual design gap the vulnerability came from:
+    there was no concept of an authorized *parent* scope independent of
+    the current roots list, so there was nothing to check a new root
+    against — checking against the *current* roots can't work (the very
+    first root being added would always fail, since self.roots starts
+    empty). `boundary` is established once at construction, from the
+    same source of per-user identity every other subsystem in this
+    codebase already uses (self.memory.persist_dir, passed in by
+    Orchestrator) rather than inferred from the roots themselves, and
+    add_root() enforces every root -- including the initial ones passed
+    to __init__ -- resolves to inside it. A user may freely organize or
+    narrow-scope any directory already under their own boundary; they
+    can never reach outside it.
     """
 
-    def __init__(self, roots: Optional[List[Path]] = None):
+    def __init__(self, roots: Optional[List[Path]] = None, *, boundary: Optional[Path | str] = None):
         if roots:
+            if boundary is None:
+                raise PermissionError(
+                    "Workspace(roots=...) requires an explicit boundary — "
+                    "the authorized per-user scope add_root() enforces against. "
+                    "Pass boundary=<the caller's own persist_dir or equivalent>; "
+                    "there is no safe default for a service-scoped workspace."
+                )
+            self.boundary = Path(boundary).expanduser().resolve()
             self.roots: List[Path] = []
             for r in roots:
                 self.add_root(r)
@@ -69,14 +99,50 @@ class Workspace:
         except OSError:
             default = Path.cwd() / "PEAR_Workspace"
             default.mkdir(parents=True, exist_ok=True)
+        # Bare construction (CLI / ad-hoc scripts, single-user trust
+        # model, per the class docstring above): the boundary is the
+        # user's own home directory. Generous enough to preserve every
+        # legitimate single-operator workflow, while still failing
+        # closed against anything outside it (another account's home
+        # directory, system paths) rather than leaving add_root()
+        # genuinely unrestricted even here.
+        self.boundary = Path.home().resolve()
         self.roots = []
         self.add_root(default)
 
     def add_root(self, path: Path | str) -> Path:
+        # Resolve before the containment check -- this is what makes
+        # symlink escapes and ../ traversal fail: a symlink or relative
+        # path that would *look* like it's inside the boundary as an
+        # unresolved string resolves to its real, final target here,
+        # and that real target is what gets checked and stored.
         p = Path(path).expanduser().resolve()
+        if p != self.boundary and self.boundary not in p.parents:
+            raise PermissionError(
+                f"refusing to add workspace root outside the authorized "
+                f"boundary {self.boundary}: {p}"
+            )
         p.mkdir(parents=True, exist_ok=True)
         if p not in self.roots:
             self.roots.append(p)
+        return p
+
+    def in_boundary(self, path: Path | str) -> bool:
+        """True if the *resolved* path is the authorized boundary itself or
+        beneath it. Fails closed if no boundary was ever established."""
+        b = getattr(self, "boundary", None)
+        if b is None:
+            return False
+        p = Path(path).expanduser().resolve()
+        return p == b or b in p.parents
+
+    def require_in_boundary(self, path: Path | str) -> Path:
+        p = Path(path).expanduser().resolve()
+        if not self.in_boundary(p):
+            raise PermissionError(
+                f"Path outside the authorized boundary "
+                f"{getattr(self, 'boundary', None)}: {p}"
+            )
         return p
 
     def remove_root(self, path: Path | str) -> None:
@@ -146,6 +212,11 @@ def copy_file(
     s = Path(src).expanduser().resolve()
     d = Path(dest).expanduser().resolve()
     if workspace:
+        if allow_outside:
+            # PEAR 3.2 Task 021: "approved" never means "beyond the
+            # user's authorized boundary" -- see move_file below.
+            workspace.require_in_boundary(s)
+            workspace.require_in_boundary(d if d.exists() else d.parent)
         if not allow_outside:
             workspace.require_inside(s)
             workspace.require_inside(d if d.suffix or d.exists() else d.parent)
@@ -196,6 +267,20 @@ def move_file(
                 "needs_approval": True,
                 "message": f"Move outside workspace requires approval: {s} → {d}",
             }
+        if outside and allow_outside:
+            # PEAR 3.2 Task 021: allow_outside=True used to skip *every*
+            # boundary check -- an approved move would execute
+            # shutil.move() on any src -> dest, including another user's
+            # files. It was only unreachable in practice because
+            # DesktopAgent._maybe_approval stores src/dest as None for
+            # move approvals (the needs_approval result carries only a
+            # message), so approving crashed. Approval can authorize
+            # touching something outside the workspace *roots*; it can
+            # never authorize going beyond the user's authorized
+            # *boundary*, so enforce that at the primitive itself rather
+            # than depending on that accident.
+            workspace.require_in_boundary(s)
+            workspace.require_in_boundary(d if d.exists() else d.parent)
         if not outside:
             workspace.require_inside(s)
     if not s.exists():

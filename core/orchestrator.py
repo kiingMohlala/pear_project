@@ -134,7 +134,14 @@ class Orchestrator:
             if getattr(self.memory, "persist_dir", None):
                 from pathlib import Path as _P
                 ws_root = _P(self.memory.persist_dir) / "workspace"
-                self.workspace = Workspace(roots=[ws_root])
+                # PEAR 3.2 Task 021: boundary is this user's own
+                # persist_dir, not just ws_root itself -- the user may
+                # freely add/organize any directory already under their
+                # own per-user tree as an additional workspace root, but
+                # Workspace.add_root() will now refuse anything outside
+                # it (another user's persist_dir, system paths), closing
+                # the unrestricted-path vulnerability found in Task 020.
+                self.workspace = Workspace(roots=[ws_root], boundary=self.memory.persist_dir)
             else:
                 self.workspace = Workspace()
         except Exception:

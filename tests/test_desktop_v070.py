@@ -28,7 +28,7 @@ def test_registry_has_desktop_tools():
 
 def test_workspace_sandbox():
     with tempfile.TemporaryDirectory() as td:
-        ws = Workspace(roots=[Path(td)])
+        ws = Workspace(roots=[Path(td)], boundary=Path(td))
         inside = Path(td) / "a.txt"
         inside.write_text("hi")
         assert ws.is_inside(inside)
@@ -43,7 +43,7 @@ def test_workspace_sandbox():
 
 def test_file_ops_in_workspace():
     with tempfile.TemporaryDirectory() as td:
-        ws = Workspace(roots=[Path(td)])
+        ws = Workspace(roots=[Path(td)], boundary=Path(td))
         create_folder(Path(td) / "sub", workspace=ws)
         src = Path(td) / "sub" / "f.txt"
         src.write_text("data")
@@ -57,7 +57,7 @@ def test_file_ops_in_workspace():
 
 def test_agent_list_and_mkdir():
     with tempfile.TemporaryDirectory() as td:
-        ws = Workspace(roots=[Path(td)])
+        ws = Workspace(roots=[Path(td)], boundary=Path(td))
         agent = DesktopAgent(workspace=ws)
         agent.memory = Memory(session_id="d1")
         r = agent.think("create folder notes")
@@ -69,7 +69,7 @@ def test_agent_list_and_mkdir():
 
 def test_delete_requires_approval():
     with tempfile.TemporaryDirectory() as td:
-        ws = Workspace(roots=[Path(td)])
+        ws = Workspace(roots=[Path(td)], boundary=Path(td))
         f = Path(td) / "x.txt"
         f.write_text("x")
         agent = DesktopAgent(workspace=ws)
@@ -84,7 +84,7 @@ def test_delete_requires_approval():
 
 def test_outside_workspace_blocked():
     with tempfile.TemporaryDirectory() as td:
-        ws = Workspace(roots=[Path(td)])
+        ws = Workspace(roots=[Path(td)], boundary=Path(td))
         agent = DesktopAgent(workspace=ws)
         agent.memory = Memory(session_id="d3")
         r = agent.think("list dir /etc")
@@ -95,7 +95,7 @@ def test_planner_routes_desktop():
     orch = Orchestrator(memory=Memory(session_id="d4"), llm=EchoLLM())
     orch.register(PersonalAgent(llm=EchoLLM()), default=True)
     with tempfile.TemporaryDirectory() as td:
-        orch.register(DesktopAgent(workspace=Workspace(roots=[Path(td)])))
+        orch.register(DesktopAgent(workspace=Workspace(roots=[Path(td)], boundary=Path(td))))
         task = orch.plan("list directory and search files in workspace")
         assert task.assigned_agent == "desktop"
 
@@ -107,7 +107,7 @@ def test_workflow_integration():
         mem = Memory(session_id="d5", persist_dir=td_path)
         orch = Orchestrator(memory=mem, llm=EchoLLM())
         orch.register(PersonalAgent(llm=EchoLLM()), default=True)
-        orch.register(DesktopAgent(workspace=Workspace(roots=[td_path])))
+        orch.register(DesktopAgent(workspace=Workspace(roots=[td_path], boundary=td_path)))
         wf = Workflow(
             name="desk_demo",
             steps=[
@@ -129,7 +129,7 @@ def test_workflow_integration():
 
 
 def test_permissions_groups():
-    agent = DesktopAgent(workspace=Workspace(roots=[Path(".")]))
+    agent = DesktopAgent(workspace=Workspace(roots=[Path(".").resolve()], boundary=Path(".").resolve()))
     assert agent.permissions.can("list_directory")
     assert agent.permissions.can("delete_file")
     agent.permissions.set_policy("delete_file", "never")
